@@ -13,11 +13,13 @@ import hashlib
 import json
 import math
 import os
+import operator
 import struct
 import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Iterable, Sequence
 
 import torch
 
@@ -30,6 +32,8 @@ ROW_BYTES = BLOCKS_PER_ROW * BLOCK_BYTES
 FORMAT = "q3_ple_32"
 VERSION = 1
 ALIGN = 4096
+REFINEMENT_PASSES = 2
+DEFAULT_SEGMENT_ROWS = 128
 
 
 def _z_path(path: str | os.PathLike[str]) -> Path:
@@ -43,6 +47,133 @@ def _z_path(path: str | os.PathLike[str]) -> Path:
     if drive.upper() != "Z:" and not str(resolved).lower().startswith("/z/"):
         raise ValueError(f"Q3_PLE_32 backing must resolve to Z:, got {resolved}")
     return resolved
+
+
+def _z_output_path(path: str | os.PathLike[str]) -> Path:
+    """Resolve an output path and require an existing ``Z:`` parent directory.
+
+    Unlike :func:`_z_path`, this helper permits the leaf file not to exist.  The
+    writer intentionally does not create arbitrary parent directories: callers
+    must choose an already-created, Z-backed fixture or checkpoint directory.
+    """
+
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError(f"Q3_PLE_32 output path must be absolute: {path}")
+    parent = candidate.parent.resolve(strict=True)
+    resolved = parent / candidate.name
+    drive, _ = os.path.splitdrive(str(resolved))
+    if drive.upper() != "Z:" and not str(resolved).lower().startswith("/z/"):
+        raise ValueError(f"Q3_PLE_32 output must resolve to Z:, got {resolved}")
+    return resolved
+
+
+def _pack_codes(codes: Sequence[int]) -> bytes:
+    if len(codes) != BLOCK_VALUES:
+        raise ValueError(f"expected {BLOCK_VALUES} codes, got {len(codes)}")
+    packed = 0
+    for index, code in enumerate(codes):
+        if not 0 <= code <= 7:
+            raise ValueError(f"code {index} is outside 0..7: {code}")
+        packed |= int(code) << (3 * index)
+    return packed.to_bytes(12, "little")
+
+
+def _bf16_bits(value: float) -> int:
+    """Round a finite Python float to an IEEE BF16 bit pattern."""
+
+    try:
+        bits = struct.unpack("<I", struct.pack("<f", value))[0]
+    except (OverflowError, struct.error) as exc:
+        raise ValueError(f"Q3_PLE_32 scale is outside float32 range: {value!r}") from exc
+    rounded = bits + 0x7FFF + ((bits >> 16) & 1)
+    return (rounded >> 16) & 0xFFFF
+
+
+def _bf16_from_bits(bits: int) -> float:
+    return struct.unpack("<f", struct.pack("<I", int(bits) << 16))[0]
+
+
+def _store_bf16_scale(value: float) -> tuple[bytes, float]:
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"Q3_PLE_32 scale must be finite and non-negative: {value!r}")
+    bits = _bf16_bits(value)
+    # A positive source scale must remain representable after BF16 storage.  A
+    # zero source scale is reserved for an all-zero block.
+    if value > 0.0 and bits == 0:
+        bits = 1
+    stored = _bf16_from_bits(bits)
+    if not math.isfinite(stored):
+        raise ValueError("Q3_PLE_32 stored BF16 scale is not finite")
+    return struct.pack("<H", bits), stored
+
+
+def _codes_for_scale(values: Sequence[float], scale: float) -> list[int]:
+    if scale == 0.0:
+        return [4] * BLOCK_VALUES
+    return [max(-4, min(3, int(round(value / scale)))) + 4 for value in values]
+
+
+def quantize_block(values: Sequence[float], *, refinement_passes: int = REFINEMENT_PASSES) -> bytes:
+    """Encode one 32-value block using the canonical Q3_PLE_32 recipe.
+
+    This mirrors ``scripts/q3_ple_32_reference.py`` while keeping production
+    conversion independent of the repository's executable reference script.
+    """
+
+    if len(values) != BLOCK_VALUES:
+        raise ValueError(f"expected {BLOCK_VALUES} values, got {len(values)}")
+    if refinement_passes < 0:
+        raise ValueError("refinement_passes must be non-negative")
+    try:
+        source = [float(value) for value in values]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Q3_PLE_32 values must be numeric") from exc
+    if not all(math.isfinite(value) for value in source):
+        raise ValueError("Q3_PLE_32 cannot encode non-finite values")
+
+    minimum = min(source)
+    maximum = max(source)
+    scale = max(-minimum / 4.0, maximum / 3.0)
+    if scale == 0.0:
+        scale_bytes, _ = _store_bf16_scale(0.0)
+        return scale_bytes + _pack_codes([4] * BLOCK_VALUES)
+
+    codes = _codes_for_scale(source, scale)
+    for _ in range(refinement_passes):
+        quants = [code - 4 for code in codes]
+        denominator = sum(quant * quant for quant in quants)
+        if denominator == 0:
+            break
+        refined = sum(value * quant for value, quant in zip(source, quants)) / denominator
+        if refined <= 0.0 or not math.isfinite(refined):
+            break
+        new_codes = _codes_for_scale(source, refined)
+        scale = refined
+        if new_codes == codes:
+            codes = new_codes
+            break
+        codes = new_codes
+
+    scale_bytes, stored_scale = _store_bf16_scale(scale)
+    # Requantize once against the stored BF16 value so decoding exactly follows
+    # runtime behavior rather than the pre-rounded Python scale.
+    codes = _codes_for_scale(source, stored_scale)
+    block = scale_bytes + _pack_codes(codes)
+    if len(block) != BLOCK_BYTES:
+        raise AssertionError(f"Q3_PLE_32 block has wrong size: {len(block)}")
+    return block
+
+
+def quantize_row(values: Sequence[float], *, refinement_passes: int = REFINEMENT_PASSES) -> bytes:
+    """Encode a 160-value row as five canonical Q3_PLE_32 blocks."""
+
+    if len(values) != ROW_VALUES:
+        raise ValueError(f"expected {ROW_VALUES} values, got {len(values)}")
+    return b"".join(
+        quantize_block(values[offset : offset + BLOCK_VALUES], refinement_passes=refinement_passes)
+        for offset in range(0, ROW_VALUES, BLOCK_VALUES)
+    )
 
 
 def _unpack_codes(payload: bytes) -> list[int]:
@@ -105,6 +236,11 @@ class Q3PLEReader:
             raise ValueError("Q3_PLE_32 row_values mismatch")
         if int(manifest.get("row_bytes", ROW_BYTES)) != ROW_BYTES:
             raise ValueError("Q3_PLE_32 row_bytes mismatch")
+        # Older Stage 6 fixtures predate this field, so absence remains
+        # readable.  A present fingerprint is always canonical SHA-256 hex;
+        # malformed provenance must fail closed rather than being ignored.
+        if "source_fingerprint" in manifest:
+            _validate_source_fingerprint(manifest["source_fingerprint"])
 
         candidate = data_path
         if candidate is None:
@@ -263,14 +399,256 @@ class Q3PLEReader:
         self.close()
 
 
+def _align_up(value: int, alignment: int = ALIGN) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+def _validate_source_fingerprint(source_fingerprint: str) -> str:
+    if not isinstance(source_fingerprint, str):
+        raise ValueError("source_fingerprint must be a 64-character SHA-256 hex string")
+    fingerprint = source_fingerprint.lower()
+    if len(fingerprint) != 64 or any(char not in "0123456789abcdef" for char in fingerprint):
+        raise ValueError("source_fingerprint must be a 64-character SHA-256 hex string")
+    return fingerprint
+
+
+def _materialize_row(row: object) -> list[float]:
+    """Materialize one bounded row without retaining any other source rows."""
+
+    if isinstance(row, torch.Tensor):
+        if row.ndim != 1 or row.numel() != ROW_VALUES:
+            raise ValueError(f"Q3_PLE_32 row must contain exactly {ROW_VALUES} values")
+        try:
+            values = row.detach().cpu().tolist()
+        except Exception as exc:
+            raise ValueError("Q3_PLE_32 row tensor could not be copied to CPU") from exc
+    else:
+        try:
+            values = list(row)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Q3_PLE_32 row must contain exactly {ROW_VALUES} values") from exc
+    if len(values) != ROW_VALUES:
+        raise ValueError(f"Q3_PLE_32 row must contain exactly {ROW_VALUES} values, got {len(values)}")
+    return values
+
+
+def _partial_path(path: Path, token: str) -> Path:
+    return path.with_name(f".{path.name}.partial-{os.getpid()}-{threading.get_ident()}-{token}")
+
+
+def _validate_segment_directory(
+    segments: Sequence[dict[str, int | str]], row_count: int, file_bytes: int
+) -> None:
+    expected_row = 0
+    previous_end = 0
+    for segment in segments:
+        first_row = int(segment["first_row"])
+        end_row = int(segment["end_row"])
+        data_offset = int(segment["data_offset"])
+        byte_length = int(segment["byte_length"])
+        digest = str(segment["sha256"])
+        if first_row != expected_row or end_row <= first_row:
+            raise ValueError("Q3_PLE_32 writer generated a malformed segment directory")
+        if data_offset < 0 or data_offset % ALIGN:
+            raise ValueError("Q3_PLE_32 writer generated an unaligned segment")
+        if byte_length != (end_row - first_row) * ROW_BYTES:
+            raise ValueError("Q3_PLE_32 writer generated a segment length mismatch")
+        if data_offset < previous_end or data_offset + byte_length > file_bytes:
+            raise ValueError("Q3_PLE_32 writer generated overlapping/out-of-range segments")
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ValueError("Q3_PLE_32 writer generated a malformed segment hash")
+        expected_row = end_row
+        previous_end = data_offset + byte_length
+    if not segments or expected_row != row_count:
+        raise ValueError("Q3_PLE_32 writer generated incomplete segment coverage")
+
+
+def _fsync(handle: object) -> None:
+    # This helper exists to keep the finalize path explicit and easy to audit;
+    # the writer only passes ordinary binary file handles here.
+    file_handle = handle  # type narrowing for type checkers without a runtime dependency
+    file_handle.flush()  # type: ignore[attr-defined]
+    os.fsync(file_handle.fileno())  # type: ignore[attr-defined]
+
+
+def write_q3_ple_sidecar(
+    rows: Iterable[Sequence[float] | torch.Tensor],
+    data_path: str | os.PathLike[str],
+    manifest_path: str | os.PathLike[str],
+    *,
+    source_fingerprint: str,
+    weight_scale: float,
+    segment_rows: int = DEFAULT_SEGMENT_ROWS,
+) -> dict:
+    """Stream rows into an atomic, reader-compatible Q3_PLE_32 sidecar.
+
+    ``rows`` is consumed exactly once and only the current 160-value row is held
+    in memory.  Segments are split in source order and begin at 4 KiB-aligned
+    offsets; alignment bytes are included in the whole-file hash but never in a
+    segment's logical length/hash.  Both files are written under unique partial
+    names, fsynced, and atomically renamed into place on successful completion.
+
+    The converter rule is intentionally fixed at two least-squares refinement
+    passes (the provisional Q3_PLE_32 recipe), and ``weight_scale`` is metadata
+    applied by the runtime after row dequantization rather than folded into the
+    per-block scales.
+    """
+
+    data_final = _z_output_path(data_path)
+    manifest_final = _z_output_path(manifest_path)
+    if data_final == manifest_final:
+        raise ValueError("Q3_PLE_32 data_path and manifest_path must differ")
+    source_digest = _validate_source_fingerprint(source_fingerprint)
+    if isinstance(segment_rows, bool):
+        raise ValueError("segment_rows must be a positive integer")
+    try:
+        segment_size = operator.index(segment_rows)
+    except TypeError as exc:
+        raise ValueError("segment_rows must be a positive integer") from exc
+    if segment_size <= 0:
+        raise ValueError("segment_rows must be a positive integer")
+    try:
+        global_scale = float(weight_scale)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("weight_scale must be finite") from exc
+    if not math.isfinite(global_scale):
+        raise ValueError("weight_scale must be finite")
+
+    # Unique tokens make concurrent conversion attempts independent and avoid
+    # ever truncating a stale partial file left by an interrupted process.
+    token = uuid.uuid4().hex
+    data_partial = _partial_path(data_final, token)
+    manifest_partial = _partial_path(manifest_final, token)
+    segments: list[dict[str, int | str]] = []
+    whole_digest = hashlib.sha256()
+    payload_digest = hashlib.sha256()
+    rows_written = 0
+    file_offset = 0
+    current_segment: dict[str, int | str] | None = None
+    segment_digest: hashlib._Hash | None = None
+
+    def write_padding(handle: object, count: int) -> None:
+        if count <= 0:
+            return
+        padding = bytes(min(1 << 20, count))
+        remaining = count
+        while remaining:
+            take = min(remaining, len(padding))
+            chunk = padding[:take]
+            handle.write(chunk)  # type: ignore[attr-defined]
+            whole_digest.update(chunk)
+            remaining -= take
+
+    try:
+        with data_partial.open("wb") as output:
+            for source_row in rows:
+                row_values = _materialize_row(source_row)
+                encoded_row = quantize_row(row_values, refinement_passes=REFINEMENT_PASSES)
+                if len(encoded_row) != ROW_BYTES:
+                    raise AssertionError(f"Q3_PLE_32 row has wrong size: {len(encoded_row)}")
+
+                if rows_written % segment_size == 0:
+                    if current_segment is not None:
+                        assert segment_digest is not None
+                        current_segment["end_row"] = rows_written
+                        current_segment["byte_length"] = (
+                            rows_written * ROW_BYTES - int(current_segment["first_row"]) * ROW_BYTES
+                        )
+                        current_segment["sha256"] = segment_digest.hexdigest()
+                        segments.append(current_segment)
+                    aligned_offset = _align_up(file_offset)
+                    write_padding(output, aligned_offset - file_offset)
+                    file_offset = aligned_offset
+                    current_segment = {
+                        "first_row": rows_written,
+                        "end_row": rows_written,
+                        "data_offset": file_offset,
+                        "byte_length": 0,
+                        "sha256": "",
+                    }
+                    segment_digest = hashlib.sha256()
+
+                assert current_segment is not None and segment_digest is not None
+                output.write(encoded_row)
+                whole_digest.update(encoded_row)
+                payload_digest.update(encoded_row)
+                segment_digest.update(encoded_row)
+                file_offset += len(encoded_row)
+                rows_written += 1
+
+            if current_segment is None:
+                raise ValueError("Q3_PLE_32 rows must contain at least one row")
+            assert segment_digest is not None
+            current_segment["end_row"] = rows_written
+            current_segment["byte_length"] = (
+                rows_written * ROW_BYTES - int(current_segment["first_row"]) * ROW_BYTES
+            )
+            current_segment["sha256"] = segment_digest.hexdigest()
+            segments.append(current_segment)
+            _fsync(output)
+    except Exception:
+        data_partial.unlink(missing_ok=True)
+        manifest_partial.unlink(missing_ok=True)
+        raise
+
+    try:
+        file_bytes = data_partial.stat().st_size
+    except Exception:
+        data_partial.unlink(missing_ok=True)
+        raise
+    if file_bytes != file_offset:
+        data_partial.unlink(missing_ok=True)
+        raise OSError(f"Q3_PLE_32 partial length mismatch: {file_bytes} != {file_offset}")
+    try:
+        _validate_segment_directory(segments, rows_written, file_bytes)
+    except Exception:
+        data_partial.unlink(missing_ok=True)
+        raise
+    manifest = {
+        "format": FORMAT,
+        "version": VERSION,
+        "endianness": "little",
+        "block_values": BLOCK_VALUES,
+        "block_bytes": BLOCK_BYTES,
+        "row_values": ROW_VALUES,
+        "row_bytes": ROW_BYTES,
+        "rows": rows_written,
+        "payload_bytes": rows_written * ROW_BYTES,
+        "file_bytes": file_bytes,
+        "data_file": os.path.relpath(data_final, manifest_final.parent),
+        "weight_scale": global_scale,
+        "source_fingerprint": source_digest,
+        "sha256": whole_digest.hexdigest(),
+        "payload_sha256": payload_digest.hexdigest(),
+        "segments": segments,
+    }
+    try:
+        with manifest_partial.open("w", encoding="utf-8", newline="\n") as manifest_handle:
+            json.dump(manifest, manifest_handle, ensure_ascii=False, indent=2, sort_keys=True)
+            manifest_handle.write("\n")
+            _fsync(manifest_handle)
+        os.replace(data_partial, data_final)
+        os.replace(manifest_partial, manifest_final)
+    except Exception:
+        data_partial.unlink(missing_ok=True)
+        manifest_partial.unlink(missing_ok=True)
+        raise
+    return manifest
+
+
 __all__ = [
     "ALIGN",
     "BLOCK_BYTES",
     "BLOCK_VALUES",
+    "DEFAULT_SEGMENT_ROWS",
     "FORMAT",
+    "REFINEMENT_PASSES",
     "Q3PLEReader",
     "Q3PLESegment",
     "ROW_BYTES",
     "ROW_VALUES",
     "VERSION",
+    "quantize_block",
+    "quantize_row",
+    "write_q3_ple_sidecar",
 ]
