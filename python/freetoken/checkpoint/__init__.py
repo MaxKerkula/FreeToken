@@ -12,8 +12,10 @@ from .ftw import (
     load_ftw_banks,
 )
 from .convert import convert_checkpoint
+from .q3_ple import Q3PLEReader, Q3PLESegment
 
 __all__ = [
     "FTWReader", "FTWWriter", "is_ftw_checkpoint",
     "iter_ftw_weights", "load_ftw_banks", "convert_checkpoint",
+    "Q3PLEReader", "Q3PLESegment",
 ]

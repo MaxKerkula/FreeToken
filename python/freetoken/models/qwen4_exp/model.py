@@ -25,13 +25,13 @@ from freetoken.layers import (
     get_rope,
 )
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.config import ModelConfig
 from freetoken.models.qwen3_5_moe.attention import Qwen3_5Attention
 from freetoken.models.qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet
+from freetoken.checkpoint.q3_ple import Q3PLEReader
 from freetoken.utils import download_hf_weight, nvtx_annotate
 
 if TYPE_CHECKING:
-    from freetoken.models.config import ModelConfig
-
     from .args import Qwen4ExpArgs
 
 
@@ -341,8 +341,20 @@ class _HostNGramEmbedding(BaseOP):
         self._scale = torch.tensor(1.0, dtype=torch.bfloat16)
         self._host_constants: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         self._dummy = False
+        self._q3_reader: Q3PLEReader | None = None
 
-    def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
+    def load_host_weights(
+        self,
+        model_path: str,
+        *,
+        dummy: bool = False,
+        ple_format: str = "fp8_safetensors",
+    ) -> None:
+        if ple_format == "q3_ple_32":
+            self.load_q3_ple_weights(model_path)
+            return
+        if ple_format != "fp8_safetensors":
+            raise ValueError(f"unsupported Qwen4 PLE format: {ple_format}")
         if dummy:
             self._dummy = True
             return
@@ -400,6 +412,28 @@ class _HostNGramEmbedding(BaseOP):
                 f"PLE table has {int(self._shard_ends[-1])} rows, needs {expected_rows}"
             )
 
+    def load_q3_ple_weights(self, manifest_path: str) -> None:
+        """Opt into the native Q3_PLE_32 sidecar; FP8 Safetensors stays default."""
+
+        reader = Q3PLEReader(manifest_path)
+        if self._host_constants is None:
+            self._host_constants = (
+                self.layer_multipliers.cpu(),
+                self.ngram_heads_vocab_sizes.cpu(),
+                self.ngram_heads_offsets.cpu(),
+            )
+        expected_rows = int(self._host_constants[1][-1] + self._host_constants[2][-1])
+        if reader.row_count < expected_rows:
+            reader.close()
+            raise RuntimeError(
+                f"Q3_PLE_32 table has {reader.row_count} rows, needs {expected_rows}"
+            )
+        self._q3_reader = reader
+        self._shards = []
+        self._handles = []
+        self._shard_ends = torch.empty(0, dtype=torch.long)
+        self._scale = torch.tensor(reader.weight_scale, dtype=torch.bfloat16)
+
     def _current_ngram_ids(self) -> torch.Tensor:
         if self._host_constants is None:
             raise RuntimeError("Qwen4-Exp PLE host weights are not loaded")
@@ -452,6 +486,10 @@ class _HostNGramEmbedding(BaseOP):
             token_count = get_global_ctx().batch.input_ids.numel()
             return torch.zeros(token_count, self.embedding_dim, device=device, dtype=dtype)
         ngram_ids = self._current_ngram_ids().reshape(-1)
+        if self._q3_reader is not None:
+            rows = self._q3_reader.gather(ngram_ids.tolist())
+            embedded = rows.to(device=device, dtype=dtype) * self._scale.to(device=device, dtype=dtype)
+            return embedded.view(-1, self.embedding_dim)
         shard_ids = torch.bucketize(ngram_ids, self._shard_ends, right=True)
         output = torch.empty(
             ngram_ids.numel(),
@@ -495,6 +533,10 @@ class _PLELayer(BaseOP):
 
     def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
         self.ple_embedding.load_host_weights(model_path, dummy=dummy)
+
+    def load_q3_ple_weights(self, manifest_path: str) -> None:
+        """Load an explicit Q3_PLE_32 sidecar for this layer."""
+        self.ple_embedding.load_q3_ple_weights(manifest_path)
 
     def _short_conv(self, hidden: torch.Tensor) -> torch.Tensor:
         batch = get_global_ctx().batch
@@ -691,6 +733,14 @@ class Qwen4ExpModel(BaseOP):
             if layer.ple is not None:
                 layer.ple.load_host_weights(model_path, dummy=dummy)
 
+    def load_q3_ple_weights(self, manifest_paths: str | dict[int, str]) -> None:
+        """Opt into Q3_PLE_32 using one manifest or a layer-id manifest map."""
+        for layer_id, layer in enumerate(self.layers.op_list):
+            if layer.ple is None:
+                continue
+            manifest = manifest_paths[layer_id] if isinstance(manifest_paths, dict) else manifest_paths
+            layer.ple.load_q3_ple_weights(manifest)
+
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         hidden = self.embed_tokens.forward(input_ids)
         mm_embeds = getattr(get_global_ctx().batch, "mm_embeds", None)
@@ -734,6 +784,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
         self.model.load_host_weights(model_path, dummy=dummy)
+
+    def load_q3_ple_weights(self, manifest_paths: str | dict[int, str]) -> None:
+        self.model.load_q3_ple_weights(manifest_paths)
 
     def forward(self) -> torch.Tensor:
         hidden = self.model.forward(get_global_ctx().batch.input_ids)
