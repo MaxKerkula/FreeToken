@@ -27,8 +27,9 @@ from freetoken.layers import (
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.models.config import ModelConfig
 from freetoken.models.qwen3_5_moe.attention import Qwen3_5Attention
-from freetoken.models.qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet
 from freetoken.checkpoint.q3_ple import Q3PLEReader
+from freetoken.models.qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet
+from freetoken.models.quant_linear import make_col_merged_quant, make_replicated_quant
 from freetoken.utils import download_hf_weight, nvtx_annotate
 
 if TYPE_CHECKING:
@@ -187,8 +188,16 @@ class _GatedResidual(BaseOP):
         self.hidden_size = config.hidden_size
         hc_size = self.hc_count * self.hidden_size
         self.hc_norm = _GroupedRMSNorm(hc_size, self.hidden_size, config.rms_norm_eps)
-        self.input_mix_weight_down = LinearReplicated(hc_size, args.hc_lowrank, has_bias=False)
-        self.input_mix_weight_up = LinearReplicated(args.hc_lowrank, hc_size, has_bias=False)
+        # The frozen Qwen4 active map keeps mHC input-mix down/up native NVFP4 when
+        # ``dense_quant=nvfp4`` is explicitly selected.  Block injection remains BF16.
+        self.input_mix_weight_down = make_replicated_quant(
+            "none", getattr(config, "dense_quant", "none"), hc_size, args.hc_lowrank,
+            has_bias=False,
+        )
+        self.input_mix_weight_up = make_replicated_quant(
+            "none", getattr(config, "dense_quant", "none"), args.hc_lowrank, hc_size,
+            has_bias=False,
+        )
         self.block_inject_weight = (
             LinearReplicated(hc_size, self.hc_count, has_bias=False) if combine else None
         )
@@ -208,10 +217,14 @@ class _GatedResidual(BaseOP):
 class _SharedExpert(BaseOP):
     def __init__(self, config: ModelConfig):
         width = config.shared_expert_intermediate_size
-        self.gate_up_proj = LinearColParallelMerged(
-            config.hidden_size, [width, width], has_bias=False
+        self.gate_up_proj = make_col_merged_quant(
+            "none", getattr(config, "dense_quant", "none"), config.hidden_size,
+            [width, width], has_bias=False,
         )
-        self.down_proj = LinearRowParallel(width, config.hidden_size, has_bias=False)
+        self.down_proj = make_replicated_quant(
+            "none", getattr(config, "dense_quant", "none"), width, config.hidden_size,
+            has_bias=False,
+        )
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(hidden)))
@@ -670,7 +683,9 @@ class Qwen4ExpDecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
         self._layer_id = layer_id
         self._is_linear = config.is_linear_layer(layer_id)
-        dense_config = replace(config, expert_quant="none", attn_quant="none")
+        # Strip routed-expert quantization from the dense attention constructor, but
+        # preserve the explicit Qwen4 active ``attn_quant`` selection.
+        dense_config = replace(config, expert_quant="none")
         if self._is_linear:
             group = config.linear_attention_group()
             assert group is not None
@@ -684,7 +699,8 @@ class Qwen4ExpDecoderLayer(BaseOP):
                 rms_norm_eps=config.rms_norm_eps,
                 layer_id=layer_id,
                 expert_quant="none",
-                attn_quant="none",
+                attn_quant=config.attn_quant,
+                nvfp4_qkvz=(config.attn_quant == "nvfp4"),
             )
             self.linear_attn.norm = _GatedRMSNorm(
                 group.value_head_dim,

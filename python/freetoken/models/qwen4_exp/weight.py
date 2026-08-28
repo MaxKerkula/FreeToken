@@ -5,6 +5,7 @@ from typing import Iterator
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
+from freetoken.checkpoint.nvfp4 import encode_bf16_nvfp4
 from freetoken.models.loader import iter_weight_files
 from tqdm import tqdm
 
@@ -22,9 +23,14 @@ _FUSIONS = {
         ".self_attn.k_proj.weight",
         ".self_attn.v_proj.weight",
     ),
-    ".linear_attn.in_proj.weight": (
+    # Canonical runtime-state names match the explicit Qwen4 GDN split: native
+    # NVFP4 qkv|z and a separate BF16 b|a projection.  Keeping these as two
+    # entries avoids a load-time dequant/re-fusion ambiguity.
+    ".linear_attn.in_proj_qkvz.weight": (
         ".linear_attn.in_proj_qkv.weight",
         ".linear_attn.in_proj_z.weight",
+    ),
+    ".linear_attn.in_proj_ba.weight": (
         ".linear_attn.in_proj_b.weight",
         ".linear_attn.in_proj_a.weight",
     ),
@@ -107,6 +113,7 @@ def iter_weights(
 
 __all__ = [
     "iter_weights",
+    "encode_bf16_nvfp4",
     "iter_weights_parallel",
     "load_nvfp4_expert_sources",
     "load_nvfp4_expert_sources_parallel",
