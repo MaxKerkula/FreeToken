@@ -17,9 +17,16 @@ from freetoken.checkpoint.q3_ple import (
     ROW_BYTES,
     ROW_VALUES,
     Q3PLEReader,
+    PRODUCTION_SEGMENT_BYTES,
+    PRODUCTION_SEGMENT_COUNT,
+    PRODUCTION_ROWS_PER_SEGMENT,
+    PRODUCTION_TOTAL_BYTES,
+    PRODUCTION_TOTAL_ROWS,
     quantize_block,
+    plan_q3_ple_production,
     write_q3_ple_from_safetensors,
     write_q3_ple_sidecar,
+    write_q3_ple_segmented_sidecar,
 )
 
 
@@ -208,3 +215,135 @@ def test_production_writer_streams_safetensor_shards_in_source_order(z_fixture_d
     assert manifest["rows"] == 4
     assert manifest["file_bytes"] == 4 * ROW_BYTES
     assert manifest["weight_scale"] == 0.5
+
+
+def _write_128_segment_source(root: Path, *, malformed: str | None = None) -> str:
+    """Create a tiny source inventory with one deterministic row per shard."""
+    from safetensors.torch import save_file
+
+    prefix = "model.language_model.layers.2.ple.ple_embedding.ngram_embedding"
+    tensors = {}
+    weight_map = {}
+    source_file = root / "model-plefp8-00000.safetensors"
+    for index in range(PRODUCTION_SEGMENT_COUNT):
+        suffix = f"shard_{index}.weight"
+        if malformed == "duplicate" and index == 18:
+            # A JSON object cannot contain a literal duplicate key.  A
+            # different spelling of the same numeric suffix exercises the
+            # production duplicate-index guard without relying on parser
+            # behavior for duplicate object members.
+            suffix = "shard_017.weight"
+        if malformed == "outside" and index == 18:
+            suffix = "shard_128.weight"
+        if malformed == "malformed" and index == 18:
+            suffix = "shard_bad.weight"
+        key = f"{prefix}.{suffix}"
+        values = torch.full((1, ROW_VALUES), float(index + 1), dtype=torch.float32)
+        tensors[key] = values.to(torch.float8_e4m3fn)
+        weight_map[key] = source_file.name
+    if malformed == "missing":
+        weight_map.pop(f"{prefix}.shard_63.weight")
+        tensors.pop(f"{prefix}.shard_63.weight")
+    if malformed == "shape":
+        tensors[f"{prefix}.shard_7.weight"] = torch.zeros((2, ROW_VALUES), dtype=torch.float8_e4m3fn)
+    tensors[f"{prefix}.weight_scale"] = torch.tensor(0.5, dtype=torch.bfloat16)
+    weight_map[f"{prefix}.weight_scale"] = source_file.name
+    save_file(tensors, source_file)
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map}), encoding="utf-8"
+    )
+    return prefix
+
+
+def test_q3_segmented_writer_has_stable_128_source_segments_and_boundaries(z_fixture_dir: Path) -> None:
+    rows = [
+        [[float(index + 1)] * ROW_VALUES]
+        for index in range(PRODUCTION_SEGMENT_COUNT)
+    ]
+    first = write_q3_ple_segmented_sidecar(
+        (iter(segment) for segment in rows),
+        z_fixture_dir / "a.bin",
+        z_fixture_dir / "a.json",
+        source_fingerprint="1" * 64,
+        weight_scale=0.5,
+        segment_count=PRODUCTION_SEGMENT_COUNT,
+    )
+    second = write_q3_ple_segmented_sidecar(
+        (iter(segment) for segment in rows),
+        z_fixture_dir / "b.bin",
+        z_fixture_dir / "b.json",
+        source_fingerprint="1" * 64,
+        weight_scale=0.5,
+        segment_count=PRODUCTION_SEGMENT_COUNT,
+    )
+    assert len(first["segments"]) == PRODUCTION_SEGMENT_COUNT
+    assert [item["first_row"] for item in first["segments"]] == list(range(128))
+    assert first["segments"][0]["data_offset"] == 0
+    assert first["segments"][1]["data_offset"] == ROW_BYTES
+    assert first["segments"][-1]["first_row"] == 127
+    assert first["segments"][-1]["end_row"] == 128
+    # Data and semantic segment directory are byte-identical across runs.
+    assert (z_fixture_dir / "a.bin").read_bytes() == (z_fixture_dir / "b.bin").read_bytes()
+    assert {k: v for k, v in first.items() if k != "data_file"} == {
+        k: v for k, v in second.items() if k != "data_file"
+    }
+
+
+def test_q3_safetensor_chunking_cannot_change_logical_segment_directory(z_fixture_dir: Path) -> None:
+    source = z_fixture_dir / "source"
+    source.mkdir()
+    _write_128_segment_source(source)
+    left = write_q3_ple_from_safetensors(
+        source, z_fixture_dir / "left.bin", z_fixture_dir / "left.json",
+        layer_id=2, split_parts=128, source_fingerprint="2" * 64,
+        processing_chunk_rows=1,
+    )
+    right = write_q3_ple_from_safetensors(
+        source, z_fixture_dir / "right.bin", z_fixture_dir / "right.json",
+        layer_id=2, split_parts=128, source_fingerprint="2" * 64,
+        processing_chunk_rows=2,
+    )
+    assert (z_fixture_dir / "left.bin").read_bytes() == (z_fixture_dir / "right.bin").read_bytes()
+    assert left["segment_count"] == right["segment_count"] == 128
+    assert left["segments"] == right["segments"]
+
+
+@pytest.mark.parametrize("bad", ["missing", "duplicate", "outside", "malformed", "shape"])
+def test_q3_safetensor_source_rejects_bad_logical_segments(z_fixture_dir: Path, bad: str) -> None:
+    source = z_fixture_dir / bad
+    source.mkdir()
+    _write_128_segment_source(source, malformed=bad)
+    with pytest.raises(ValueError):
+        write_q3_ple_from_safetensors(
+            source, z_fixture_dir / f"{bad}.bin", z_fixture_dir / f"{bad}.json",
+            layer_id=2, split_parts=128, source_fingerprint="3" * 64,
+            rows_per_segment=1,
+        )
+
+
+@pytest.mark.parametrize("segment_count", [127, 129])
+def test_q3_segmented_writer_rejects_wrong_segment_count(z_fixture_dir: Path, segment_count: int) -> None:
+    segments = ([float(index)] * ROW_VALUES for index in range(128))
+    with pytest.raises(ValueError):
+        write_q3_ple_segmented_sidecar(
+            ((row,) for row in segments),
+            z_fixture_dir / f"{segment_count}.bin",
+            z_fixture_dir / f"{segment_count}.json",
+            source_fingerprint="4" * 64,
+            weight_scale=1.0,
+            segment_count=segment_count,
+        )
+
+
+def test_q3_production_planner_is_exact_without_allocating_payload() -> None:
+    plan = plan_q3_ple_production()
+    assert plan == {
+        "segment_count": 128,
+        "rows_per_segment": 2_500_012,
+        "total_rows": 320_001_536,
+        "row_bytes": ROW_BYTES,
+        "segment_bytes": 175_000_840,
+        "total_bytes": 22_400_107_520,
+    }
+    assert PRODUCTION_SEGMENT_COUNT * PRODUCTION_ROWS_PER_SEGMENT == PRODUCTION_TOTAL_ROWS
+    assert PRODUCTION_SEGMENT_COUNT * PRODUCTION_SEGMENT_BYTES == PRODUCTION_TOTAL_BYTES

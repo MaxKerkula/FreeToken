@@ -143,6 +143,7 @@ def test_convert_checkpoint_builds_marked_modular_active_ftw(tmp_path: Path, mon
     config = json.loads((output / "config.json").read_text(encoding="utf-8"))
     assert config["freetoken_text_only"] == "qwen4_text_only_v1"
     assert config["freetoken_active_quant"] == "nvfp4_w4a16_v1"
+    assert config["freetoken_runtime_foundation"] == "pr257_hardware_fit_v1"
     loaded = dict(iter_ftw_weights(str(output / "qwen4-active-v1.ftw"), workers=1))
     assert set(loaded) == {
         "model.layers.0.self_attn.o_proj.weight",

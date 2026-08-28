@@ -389,6 +389,7 @@ def convert_checkpoint(
             config_data = json.load(handle)
         config_data["freetoken_text_only"] = "qwen4_text_only_v1"
         config_data["freetoken_active_quant"] = "nvfp4_w4a16_v1"
+        config_data["freetoken_runtime_foundation"] = "pr257_hardware_fit_v1"
         tmp_config = config_path + ".tmp"
         with open(tmp_config, "w", encoding="utf-8") as handle:
             json.dump(config_data, handle, indent=2, sort_keys=True)

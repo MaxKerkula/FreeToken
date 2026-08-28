@@ -35,6 +35,28 @@ ALIGN = 4096
 REFINEMENT_PASSES = 2
 DEFAULT_SEGMENT_ROWS = 128
 
+# Production Qwen4 PLE geometry.  ``segment_count`` is a logical source
+# tensor count; it is deliberately independent from the bounded row chunk used
+# while reading a Safetensors tensor.
+PRODUCTION_SEGMENT_COUNT = 128
+PRODUCTION_ROWS_PER_SEGMENT = 2_500_012
+PRODUCTION_TOTAL_ROWS = 320_001_536
+PRODUCTION_SEGMENT_BYTES = 175_000_840
+PRODUCTION_TOTAL_BYTES = 22_400_107_520
+
+
+def plan_q3_ple_production() -> dict[str, int]:
+    """Return the frozen real-table plan without allocating any payload."""
+
+    return {
+        "segment_count": PRODUCTION_SEGMENT_COUNT,
+        "rows_per_segment": PRODUCTION_ROWS_PER_SEGMENT,
+        "total_rows": PRODUCTION_TOTAL_ROWS,
+        "row_bytes": ROW_BYTES,
+        "segment_bytes": PRODUCTION_SEGMENT_BYTES,
+        "total_bytes": PRODUCTION_TOTAL_BYTES,
+    }
+
 
 def _z_path(path: str | os.PathLike[str]) -> Path:
     """Resolve *path* and fail closed unless its physical drive is ``Z:``."""
@@ -266,6 +288,8 @@ class Q3PLEReader:
         if not isinstance(raw_segments, list) or not raw_segments:
             raise ValueError("Q3_PLE_32 segment directory is empty")
         self.segments: tuple[Q3PLESegment, ...] = tuple(self._parse_segment(item) for item in raw_segments)
+        if "segment_count" in manifest and int(manifest["segment_count"]) != len(self.segments):
+            raise ValueError("Q3_PLE_32 segment_count does not match the segment directory")
         self._validate_segments()
         stat = self.data_path.stat()
         expected_file_bytes = int(manifest.get("file_bytes", stat.st_size))
@@ -630,6 +654,148 @@ def write_q3_ple_sidecar(
     return manifest
 
 
+def write_q3_ple_segmented_sidecar(
+    segments: Iterable[Iterable[Sequence[float] | torch.Tensor]],
+    data_path: str | os.PathLike[str],
+    manifest_path: str | os.PathLike[str],
+    *,
+    source_fingerprint: str,
+    weight_scale: float,
+    segment_count: int,
+    rows_per_segment: int | None = None,
+) -> dict:
+    """Write Q3 data with explicit logical source-segment boundaries.
+
+    Each item in ``segments`` represents one source tensor (for production,
+    ``shard_0`` through ``shard_127``).  Segment identity is therefore stable
+    regardless of the internal row-chunk size used by the caller.  The legacy
+    :func:`write_q3_ple_sidecar` API remains row-count based for compatibility
+    with small historical fixtures; production Safetensors conversion uses
+    this explicit API instead.
+    """
+
+    data_final = _z_output_path(data_path)
+    manifest_final = _z_output_path(manifest_path)
+    if data_final == manifest_final:
+        raise ValueError("Q3_PLE_32 data_path and manifest_path must differ")
+    source_digest = _validate_source_fingerprint(source_fingerprint)
+    if isinstance(segment_count, bool):
+        raise ValueError("segment_count must be a positive integer")
+    try:
+        expected_segments = operator.index(segment_count)
+    except TypeError as exc:
+        raise ValueError("segment_count must be a positive integer") from exc
+    if expected_segments <= 0:
+        raise ValueError("segment_count must be a positive integer")
+    expected_rows = None if rows_per_segment is None else operator.index(rows_per_segment)
+    if expected_rows is not None and expected_rows <= 0:
+        raise ValueError("rows_per_segment must be a positive integer")
+    try:
+        global_scale = float(weight_scale)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("weight_scale must be finite") from exc
+    if not math.isfinite(global_scale):
+        raise ValueError("weight_scale must be finite")
+
+    token = uuid.uuid4().hex
+    data_partial = _partial_path(data_final, token)
+    manifest_partial = _partial_path(manifest_final, token)
+    segments_manifest: list[dict[str, int | str]] = []
+    whole_digest = hashlib.sha256()
+    payload_digest = hashlib.sha256()
+    rows_written = 0
+    file_offset = 0
+
+    try:
+        with data_partial.open("wb") as output:
+            for segment_index, source_segment in enumerate(segments):
+                if segment_index >= expected_segments:
+                    raise ValueError(
+                        f"Q3_PLE_32 expected {expected_segments} logical segments, got more"
+                    )
+                first_row = rows_written
+                segment_offset = file_offset
+                segment_digest = hashlib.sha256()
+                segment_rows = 0
+                for source_row in source_segment:
+                    row_values = _materialize_row(source_row)
+                    encoded_row = quantize_row(row_values, refinement_passes=REFINEMENT_PASSES)
+                    if len(encoded_row) != ROW_BYTES:
+                        raise AssertionError(f"Q3_PLE_32 row has wrong size: {len(encoded_row)}")
+                    output.write(encoded_row)
+                    whole_digest.update(encoded_row)
+                    payload_digest.update(encoded_row)
+                    segment_digest.update(encoded_row)
+                    file_offset += len(encoded_row)
+                    rows_written += 1
+                    segment_rows += 1
+                if segment_rows <= 0:
+                    raise ValueError(f"Q3_PLE_32 logical segment {segment_index} is empty")
+                if expected_rows is not None and segment_rows != expected_rows:
+                    raise ValueError(
+                        f"Q3_PLE_32 logical segment {segment_index} has {segment_rows} rows, "
+                        f"expected {expected_rows}"
+                    )
+                segments_manifest.append(
+                    {
+                        "first_row": first_row,
+                        "end_row": rows_written,
+                        "data_offset": segment_offset,
+                        "byte_length": segment_rows * ROW_BYTES,
+                        "sha256": segment_digest.hexdigest(),
+                    }
+                )
+            if len(segments_manifest) != expected_segments:
+                raise ValueError(
+                    f"Q3_PLE_32 expected {expected_segments} logical segments, "
+                    f"got {len(segments_manifest)}"
+                )
+            _fsync(output)
+    except Exception:
+        data_partial.unlink(missing_ok=True)
+        manifest_partial.unlink(missing_ok=True)
+        raise
+
+    file_bytes = data_partial.stat().st_size
+    if file_bytes != file_offset:
+        data_partial.unlink(missing_ok=True)
+        raise OSError(f"Q3_PLE_32 partial length mismatch: {file_bytes} != {file_offset}")
+    _validate_segment_directory(segments_manifest, rows_written, file_bytes)
+    manifest = {
+        "format": FORMAT,
+        "version": VERSION,
+        "endianness": "little",
+        "block_values": BLOCK_VALUES,
+        "block_bytes": BLOCK_BYTES,
+        "row_values": ROW_VALUES,
+        "row_bytes": ROW_BYTES,
+        "rows": rows_written,
+        "payload_bytes": rows_written * ROW_BYTES,
+        "file_bytes": file_bytes,
+        "storage_layout": "contiguous_rows_v1",
+        "data_file": os.path.relpath(data_final, manifest_final.parent),
+        "weight_scale": global_scale,
+        "source_fingerprint": source_digest,
+        "sha256": whole_digest.hexdigest(),
+        "payload_sha256": payload_digest.hexdigest(),
+        "segments": segments_manifest,
+        "segment_count": expected_segments,
+        "segment_identity": "source_tensor_numeric_suffix_v1",
+    }
+    try:
+        with manifest_partial.open("w", encoding="utf-8", newline="\n") as manifest_handle:
+            json.dump(manifest, manifest_handle, ensure_ascii=False, indent=2, sort_keys=True)
+            manifest_handle.write("\n")
+            _fsync(manifest_handle)
+        os.replace(data_partial, data_final)
+        os.replace(manifest_partial, manifest_final)
+    except Exception:
+        data_partial.unlink(missing_ok=True)
+        manifest_partial.unlink(missing_ok=True)
+        raise
+    return manifest
+
+
 def write_q3_ple_from_safetensors(
     model_path: str | os.PathLike[str],
     data_path: str | os.PathLike[str],
@@ -639,7 +805,10 @@ def write_q3_ple_from_safetensors(
     split_parts: int,
     source_fingerprint: str,
     rows_per_chunk: int = 8192,
-    segment_rows: int = DEFAULT_SEGMENT_ROWS,
+    segment_rows: int | None = None,
+    processing_chunk_rows: int | None = None,
+    segment_count: int | None = None,
+    rows_per_segment: int | None = None,
 ) -> dict:
     """Stream the official FP8 PLE shards into the native Q3 sidecar.
 
@@ -652,8 +821,24 @@ def write_q3_ple_from_safetensors(
     folder = Path(model_path).expanduser().resolve()
     if not folder.is_dir():
         raise ValueError(f"Q3 PLE source must be a local checkpoint directory: {folder}")
+    if processing_chunk_rows is not None:
+        if rows_per_chunk != 8192:
+            raise ValueError("specify only one of rows_per_chunk or processing_chunk_rows")
+        rows_per_chunk = processing_chunk_rows
     if rows_per_chunk <= 0 or split_parts <= 0:
-        raise ValueError("rows_per_chunk and split_parts must be positive")
+        raise ValueError("processing chunk rows and split_parts must be positive")
+    if segment_rows is not None:
+        # ``segment_rows`` was the legacy flat-stream API.  Keep it for small
+        # fixtures, but production conversion must use explicit source tensor
+        # segments so a value of 128 can never mean 128 rows per segment.
+        if segment_count is not None or rows_per_segment is not None:
+            raise ValueError("segment_rows cannot be combined with explicit segment geometry")
+        if int(split_parts) == PRODUCTION_SEGMENT_COUNT and int(segment_rows) == DEFAULT_SEGMENT_ROWS:
+            # Historical callers passed ``segment_rows=128`` intending the
+            # production 128 logical tensors.  Treat that exact combination as
+            # the explicit segmented contract; it must never create 128-row
+            # chunks across the complete flattened table.
+            segment_rows = None
     index_path = folder / "model.safetensors.index.json"
     with index_path.open("r", encoding="utf-8") as handle:
         weight_map = json.load(handle)["weight_map"]
@@ -662,6 +847,26 @@ def write_q3_ple_from_safetensors(
         "ngram_embedding"
     )
     shard_keys = [f"{prefix}.shard_{part}.weight" for part in range(int(split_parts))]
+    shard_prefix = prefix + ".shard_"
+    indexed_keys: dict[int, str] = {}
+    for key in weight_map:
+        if not isinstance(key, str) or not key.startswith(shard_prefix):
+            continue
+        suffix = key[len(shard_prefix) :]
+        if not suffix.endswith(".weight"):
+            raise ValueError(f"malformed PLE source tensor suffix: {key}")
+        index_text = suffix[: -len(".weight")]
+        if not index_text.isdigit():
+            raise ValueError(f"malformed PLE source tensor suffix: {key}")
+        index = int(index_text)
+        if index in indexed_keys:
+            raise ValueError(f"duplicate PLE source tensor index: {index}")
+        if not 0 <= index < int(split_parts):
+            raise ValueError(f"PLE source tensor index outside 0..{int(split_parts) - 1}: {index}")
+        indexed_keys[index] = key
+    if set(indexed_keys) != set(range(int(split_parts))):
+        missing_indices = sorted(set(range(int(split_parts))) - set(indexed_keys))
+        raise ValueError(f"missing PLE source tensor indices: {missing_indices}")
     missing = [key for key in shard_keys if key not in weight_map]
     scale_key = prefix + ".weight_scale"
     if missing or scale_key not in weight_map:
@@ -674,28 +879,50 @@ def write_q3_ple_from_safetensors(
         scale = handle.get_tensor(scale_key).reshape(())
     weight_scale = float(scale.float().item())
 
-    def iter_rows():
-        for key in shard_keys:
-            source_file = folder / weight_map[key]
-            with safetensors.safe_open(source_file, framework="pt", device="cpu") as handle:
-                sliced = handle.get_slice(key)
-                shape = tuple(int(value) for value in sliced.get_shape())
-                if len(shape) != 2 or shape[1] != ROW_VALUES:
-                    raise ValueError(f"unexpected PLE source shape for {key}: {shape}")
-                for start in range(0, shape[0], int(rows_per_chunk)):
-                    chunk = sliced[start : min(start + int(rows_per_chunk), shape[0])]
-                    if chunk.dtype != torch.float8_e4m3fn:
-                        raise ValueError(f"unexpected PLE source dtype for {key}: {chunk.dtype}")
-                    for row in chunk.float():
-                        yield row
+    def iter_segment_rows(key: str):
+        source_file = folder / weight_map[key]
+        with safetensors.safe_open(source_file, framework="pt", device="cpu") as handle:
+            sliced = handle.get_slice(key)
+            shape = tuple(int(value) for value in sliced.get_shape())
+            if len(shape) != 2 or shape[1] != ROW_VALUES:
+                raise ValueError(f"unexpected PLE source shape for {key}: {shape}")
+            if rows_per_segment is not None and shape[0] != int(rows_per_segment):
+                raise ValueError(
+                    f"unexpected PLE source row count for {key}: {shape[0]} != {rows_per_segment}"
+                )
+            for start in range(0, shape[0], int(rows_per_chunk)):
+                chunk = sliced[start : min(start + int(rows_per_chunk), shape[0])]
+                if chunk.dtype != torch.float8_e4m3fn:
+                    raise ValueError(f"unexpected PLE source dtype for {key}: {chunk.dtype}")
+                for row in chunk.float():
+                    yield row
 
-    return write_q3_ple_sidecar(
-        iter_rows(),
+    # Explicit segmented mode is the production contract.  Legacy callers can
+    # request flat row segmentation by passing ``segment_rows`` explicitly.
+    if segment_rows is not None:
+        def iter_rows():
+            for key in shard_keys:
+                yield from iter_segment_rows(key)
+
+        return write_q3_ple_sidecar(
+            iter_rows(), data_path, manifest_path,
+            source_fingerprint=source_fingerprint,
+            weight_scale=weight_scale,
+            segment_rows=segment_rows,
+        )
+
+    logical_count = int(segment_count if segment_count is not None else split_parts)
+    if logical_count != int(split_parts):
+        raise ValueError("segment_count must equal split_parts for PLE Safetensors conversion")
+    ordered_segments = (iter_segment_rows(indexed_keys[index]) for index in range(logical_count))
+    return write_q3_ple_segmented_sidecar(
+        ordered_segments,
         data_path,
         manifest_path,
         source_fingerprint=source_fingerprint,
         weight_scale=weight_scale,
-        segment_rows=segment_rows,
+        segment_count=logical_count,
+        rows_per_segment=rows_per_segment,
     )
 
 
@@ -711,8 +938,15 @@ __all__ = [
     "ROW_BYTES",
     "ROW_VALUES",
     "VERSION",
+    "PRODUCTION_SEGMENT_COUNT",
+    "PRODUCTION_ROWS_PER_SEGMENT",
+    "PRODUCTION_TOTAL_ROWS",
+    "PRODUCTION_SEGMENT_BYTES",
+    "PRODUCTION_TOTAL_BYTES",
+    "plan_q3_ple_production",
     "quantize_block",
     "quantize_row",
     "write_q3_ple_sidecar",
+    "write_q3_ple_segmented_sidecar",
     "write_q3_ple_from_safetensors",
 ]

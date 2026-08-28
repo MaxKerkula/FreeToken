@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 from freetoken.checkpoint.qwen4_artifact import (
     FORMAT,
+    RUNTIME_FOUNDATION_MARKER,
     TEXT_ONLY_MARKER,
     build_qwen4_modular_artifact,
     configure_mixed_expert_sources,
@@ -84,6 +85,7 @@ def _manifest(root: Path, sidecar: Path, digest: str) -> Path:
         "version": 1,
         "artifact_schema": FORMAT,
         "text_only": True,
+        "runtime_foundation": RUNTIME_FOUNDATION_MARKER,
         "source": {"repository": "synthetic", "revision": "test", "inventory_sha256": source_fingerprint},
         "minimum_freetoken_commit": "0" * 40,
         "tvm_ffi_patch_sha256": "0" * 64,
@@ -257,6 +259,7 @@ def test_resident_builder_streams_one_record_without_full_layer(z_fixture_dir):
         "version": 1,
         "artifact_schema": FORMAT,
         "text_only": True,
+        "runtime_foundation": RUNTIME_FOUNDATION_MARKER,
         "source": {"repository": "synthetic", "revision": "test", "inventory_sha256": source_fingerprint},
         "minimum_freetoken_commit": "0" * 40,
         "tvm_ffi_patch_sha256": "0" * 64,
@@ -317,6 +320,7 @@ def test_end_to_end_synthetic_modular_artifact_reopens_normal_paths(z_fixture_di
         "architectures": ["Qwen4ExpForConditionalGeneration"],
         "freetoken_text_only": TEXT_ONLY_MARKER,
         "freetoken_active_quant": "nvfp4_w4a16_v1",
+        "freetoken_runtime_foundation": "pr257_hardware_fit_v1",
     }
     (z_fixture_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
     (z_fixture_dir / "tokenizer_config.json").write_text("{}", encoding="utf-8")
@@ -435,6 +439,7 @@ def test_production_orchestrator_sequences_all_modular_components(z_fixture_dir,
             json.dumps({
                 "freetoken_text_only": TEXT_ONLY_MARKER,
                 "freetoken_active_quant": "nvfp4_w4a16_v1",
+                "freetoken_runtime_foundation": "pr257_hardware_fit_v1",
             }),
             encoding="utf-8",
         )

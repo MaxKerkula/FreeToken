@@ -39,6 +39,7 @@ FILE_TIER_LAYERS = (0, 1, 2, 3, 4, 5, 42, 43, 44, 45, 46, 47)
 PINNED_SOURCE_REPOSITORY = "RadixArk/Qwen3.8-Flash-Next-NVFP4"
 PINNED_SOURCE_REVISION = "7b719225242aacd3dbd3f9407468c2ee9a9d2594"
 TVM_FFI_PATCH_SHA256 = "889310b8152a147a6552a3e451b3251a7df70cdc8e6e4c1c87c7adf3854182ec"
+RUNTIME_FOUNDATION_MARKER = "pr257_hardware_fit_v1"
 
 
 class Qwen4ArtifactError(ValueError):
@@ -276,6 +277,8 @@ def load_qwen4_artifact_manifest(
         raise Qwen4ArtifactError("unsupported Qwen4 modular artifact_schema")
     if root.get("text_only") is not True:
         raise Qwen4ArtifactError("Qwen4 modular manifest must declare text_only=true")
+    if root.get("runtime_foundation") != RUNTIME_FOUNDATION_MARKER:
+        raise Qwen4ArtifactError("Qwen4 modular manifest lacks the accepted runtime foundation")
     source = _require_mapping(root.get("source"), label="source")
     if not str(source.get("repository", "")).strip() or not str(source.get("revision", "")).strip():
         raise Qwen4ArtifactError("source repository and revision are required")
@@ -677,6 +680,7 @@ def build_qwen4_modular_artifact(
         layer_id=int(ple_layer_id),
         split_parts=int(ple_split_parts),
         source_fingerprint=inventory,
+        rows_per_segment=(None if allow_synthetic_geometry else 2_500_012),
     )
     expert_paths: dict[int, str] = {}
     for layer in expert_layers:
@@ -829,12 +833,16 @@ def finalize_qwen4_modular_manifest(
         raise Qwen4ArtifactError("config.json lacks the accepted text-only marker")
     if config.get("freetoken_active_quant") != ACTIVE_FORMAT:
         raise Qwen4ArtifactError("config.json lacks the accepted active-quant marker")
+    config_runtime_foundation = config.get("freetoken_runtime_foundation")
+    if config_runtime_foundation != RUNTIME_FOUNDATION_MARKER:
+        raise Qwen4ArtifactError("config.json lacks the accepted runtime-foundation marker")
 
     manifest: dict[str, Any] = {
         "format": FORMAT,
         "version": VERSION,
         "artifact_schema": FORMAT,
         "text_only": True,
+        "runtime_foundation": RUNTIME_FOUNDATION_MARKER,
         "source": {
             "repository": str(source_repository),
             "revision": str(source_revision),
@@ -890,6 +898,7 @@ __all__ = [
     "Qwen4ArtifactError",
     "Qwen4ArtifactManifest",
     "TEXT_ONLY_MARKER",
+    "RUNTIME_FOUNDATION_MARKER",
     "VERSION",
     "build_qwen4_modular_artifact",
     "configure_mixed_expert_sources",
