@@ -6,8 +6,13 @@ import pytest
 import torch
 
 import freetoken.models.qwen4_exp as qwen4_exp
+import freetoken.models.qwen4_exp.model as qwen4_model
 from freetoken.models.qwen4_exp.config import parse_config
-from freetoken.models.qwen4_exp.model import _ple_request_tokens, build_ngram_ids
+from freetoken.models.qwen4_exp.model import (
+    _HostNGramEmbedding,
+    _ple_request_tokens,
+    build_ngram_ids,
+)
 from freetoken.models.qwen4_exp.weight import _rename, _try_fuse
 from freetoken.models.register import get_model_spec
 
@@ -105,6 +110,13 @@ def test_qwen4_config_accepts_transformers_sparse_attention_alias():
 def test_qwen4_config_accepts_missing_norm_topk_prob():
     hf_config = _config()
     del hf_config.text_config.norm_topk_prob
+    config = parse_config(hf_config)
+    assert config.norm_topk_prob
+
+
+def test_qwen4_config_preserves_explicit_false_norm_topk_prob():
+    hf_config = _config()
+    hf_config.text_config.norm_topk_prob = False
     config = parse_config(hf_config)
     assert not config.norm_topk_prob
 
@@ -211,6 +223,19 @@ def test_ple_request_tokens_uses_complete_prefill_history():
     assert _ple_request_tokens(req).tolist() == [11, 12, 13]
 
 
+def test_ple_request_tokens_uses_bounded_non_overlap_decode_suffix():
+    history = torch.tensor([10, 11, 12, 13, 14, 15])
+    req = SimpleNamespace(
+        input_ids=history,
+        cached_len=5,
+        device_len=6,
+        extend_len=1,
+    )
+
+    assert _ple_request_tokens(req, start=3).tolist() == [13, 14, 15]
+    assert torch.equal(req.input_ids, history)
+
+
 def test_ple_request_tokens_joins_overlap_decode_token():
     req = SimpleNamespace(
         input_ids=torch.tensor([11, 12]),
@@ -219,6 +244,33 @@ def test_ple_request_tokens_joins_overlap_decode_token():
         extend_len=1,
     )
     assert _ple_request_tokens(req, torch.tensor([13])).tolist() == [11, 12, 13]
+
+
+def test_ple_request_tokens_bounds_overlap_multi_token_extension():
+    history = torch.tensor([10, 11, 12, 13, 14, 15, 16, 17])
+    req = SimpleNamespace(
+        input_ids=history,
+        cached_len=8,
+        device_len=11,
+        extend_len=3,
+    )
+
+    tokens = _ple_request_tokens(req, torch.tensor([18, 19, 20]), start=6)
+
+    assert tokens.tolist() == [16, 17, 18, 19, 20]
+    assert tokens.numel() == 2 + req.extend_len
+    assert torch.equal(req.input_ids, history)
+
+
+def test_ple_request_tokens_validates_overlap_forwarded_token_count():
+    req = SimpleNamespace(
+        input_ids=torch.tensor([11, 12]),
+        cached_len=2,
+        device_len=4,
+        extend_len=2,
+    )
+    with pytest.raises(RuntimeError, match="needs the current forwarded tokens"):
+        _ple_request_tokens(req, torch.tensor([13]))
 
 
 def test_ple_request_tokens_rejects_noncontiguous_host_history():
@@ -230,3 +282,94 @@ def test_ple_request_tokens_rejects_noncontiguous_host_history():
     )
     with pytest.raises(RuntimeError, match="unexpected gap"):
         _ple_request_tokens(req, torch.tensor([13]))
+
+
+@pytest.mark.parametrize("start", [-1, 4])
+def test_ple_request_tokens_rejects_invalid_suffix_start(start):
+    req = SimpleNamespace(
+        input_ids=torch.tensor([11, 12, 13]),
+        cached_len=2,
+        device_len=3,
+        extend_len=1,
+    )
+    with pytest.raises(ValueError, match="history start"):
+        _ple_request_tokens(req, start=start)
+
+
+def test_incremental_ngram_ids_match_full_history_across_eos_boundary():
+    tokens = torch.tensor([10, 99, 4, 5, 6])
+    kwargs = {
+        "ngram_size": 3,
+        "heads_per_ngram": 1,
+        "eos_token_id": 99,
+        "multipliers": torch.tensor([3, 5, 7]),
+        "vocab_sizes": torch.tensor([101, 103]),
+        "offsets": torch.tensor([0, 101]),
+    }
+    cached_len = 3
+    history_start = cached_len - (kwargs["ngram_size"] - 1)
+
+    full = build_ngram_ids(tokens, **kwargs)
+    incremental = build_ngram_ids(tokens[history_start:], **kwargs)
+
+    assert torch.equal(
+        incremental[cached_len - history_start :],
+        full[cached_len:],
+    )
+
+
+def test_current_ngram_ids_keeps_forwarded_offsets_request_local(monkeypatch):
+    req_a_history = torch.tensor([1, 2])
+    req_b_history = torch.tensor([10, 11, 12])
+    req_a = SimpleNamespace(
+        input_ids=req_a_history,
+        cached_len=2,
+        device_len=4,
+        extend_len=2,
+    )
+    req_b = SimpleNamespace(
+        input_ids=req_b_history,
+        cached_len=3,
+        device_len=4,
+        extend_len=1,
+    )
+    batch = SimpleNamespace(
+        is_decode=True,
+        padded_reqs=[req_a, req_b],
+        input_ids=torch.tensor([3, 4, 13]),
+    )
+    monkeypatch.setattr(qwen4_model, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
+
+    multipliers = torch.tensor([3, 5, 7])
+    vocab_sizes = torch.tensor([101, 103])
+    offsets = torch.tensor([0, 101])
+    embedding = SimpleNamespace(
+        _host_constants=(multipliers, vocab_sizes, offsets),
+        ngram_size=3,
+        heads_per_ngram=1,
+        eos_token_id=99,
+    )
+
+    actual = _HostNGramEmbedding._current_ngram_ids(embedding)
+    expected_a = build_ngram_ids(
+        torch.tensor([1, 2, 3, 4]),
+        ngram_size=3,
+        heads_per_ngram=1,
+        eos_token_id=99,
+        multipliers=multipliers,
+        vocab_sizes=vocab_sizes,
+        offsets=offsets,
+    )[2:]
+    expected_b = build_ngram_ids(
+        torch.tensor([10, 11, 12, 13]),
+        ngram_size=3,
+        heads_per_ngram=1,
+        eos_token_id=99,
+        multipliers=multipliers,
+        vocab_sizes=vocab_sizes,
+        offsets=offsets,
+    )[3:]
+
+    assert torch.equal(actual, torch.cat((expected_a, expected_b)))
+    assert torch.equal(req_a.input_ids, req_a_history)
+    assert torch.equal(req_b.input_ids, req_b_history)

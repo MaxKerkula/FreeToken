@@ -159,9 +159,9 @@ def parse_config(hf_config: Any) -> ModelConfig:
         num_experts_per_tok=int(text.num_experts_per_tok),
         moe_intermediate_size=int(text.moe_intermediate_size),
         shared_expert_intermediate_size=int(text.shared_expert_intermediate_size),
-        # The released Qwen3.8-Flash-Next configs omit this older Qwen MoE
-        # field. Omission means that the router weights are not renormalized.
-        norm_topk_prob=bool(getattr(text, "norm_topk_prob", False)),
+        # The official Qwen4-Exp config defaults this field to True. Released
+        # checkpoints may omit it, while an explicit False must remain False.
+        norm_topk_prob=bool(getattr(text, "norm_topk_prob", True)),
         model_type=str(hf_config.model_type),
         architectures=list(hf_config.architectures),
         moe_enabled=True,

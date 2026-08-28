@@ -278,17 +278,28 @@ def build_ngram_ids(
     return torch.cat(blocks, dim=-1)
 
 
-def _ple_request_tokens(req, forwarded_ids: torch.Tensor | None = None) -> torch.Tensor:
-    """Return the complete host token history visible to this forward.
+def _ple_request_tokens(
+    req,
+    forwarded_ids: torch.Tensor | None = None,
+    *,
+    start: int = 0,
+) -> torch.Tensor:
+    """Return host-visible request tokens from ``start`` through ``device_len``.
 
     The overlap scheduler advances ``device_len`` before it drains the prior
     sampled token to ``req.input_ids``. During decode, that one current token is
     already present in ``batch.input_ids``. Join it to the committed host prefix
-    so PLE hashes the same history as a non-overlapped forward.
+    so PLE hashes the same history as a non-overlapped forward. The default
+    preserves the complete-history contract; callers may select a validated
+    suffix when only the N-gram dependency prefix is needed.
     """
+    if not 0 <= start <= req.device_len:
+        raise ValueError(
+            f"Qwen4-Exp PLE history start {start} is outside [0, {req.device_len}]"
+        )
     host_len = req.input_ids.numel()
     if host_len >= req.device_len:
-        return req.input_ids[: req.device_len]
+        return req.input_ids[start : req.device_len]
     if host_len != req.cached_len:
         raise RuntimeError(
             "Qwen4-Exp PLE host history has an unexpected gap: "
@@ -300,7 +311,14 @@ def _ple_request_tokens(req, forwarded_ids: torch.Tensor | None = None) -> torch
             "Qwen4-Exp PLE needs the current forwarded tokens: "
             f"got {actual}, expected {req.extend_len}"
         )
-    return torch.cat((req.input_ids[: req.cached_len], forwarded_ids.to(device="cpu")))
+    host_start = min(start, req.cached_len)
+    forwarded_start = max(0, start - req.cached_len)
+    return torch.cat(
+        (
+            req.input_ids[host_start : req.cached_len],
+            forwarded_ids[forwarded_start:].to(device="cpu"),
+        )
+    )
 
 
 class _HostNGramEmbedding(BaseOP):
@@ -400,7 +418,8 @@ class _HostNGramEmbedding(BaseOP):
                 forwarded = forwarded_host[
                     forwarded_offset : forwarded_offset + extend_len
                 ]
-            tokens = _ple_request_tokens(req, forwarded)
+            history_start = max(0, req.cached_len - (self.ngram_size - 1))
+            tokens = _ple_request_tokens(req, forwarded, start=history_start)
             all_ids = build_ngram_ids(
                 tokens,
                 ngram_size=self.ngram_size,
@@ -410,8 +429,17 @@ class _HostNGramEmbedding(BaseOP):
                 vocab_sizes=vocab_sizes,
                 offsets=offsets,
             )
-            pieces.append(all_ids[req.cached_len : req.device_len])
+            pieces.append(
+                all_ids[
+                    req.cached_len - history_start : req.device_len - history_start
+                ]
+            )
             forwarded_offset += extend_len
+        if forwarded_offset != batch.input_ids.numel():
+            raise RuntimeError(
+                f"Qwen4-Exp PLE consumed {forwarded_offset} forwarded tokens, "
+                f"but the batch carries {batch.input_ids.numel()}"
+            )
         result = torch.cat(pieces, dim=0)
         if result.shape[0] != batch.input_ids.numel():
             raise RuntimeError(
