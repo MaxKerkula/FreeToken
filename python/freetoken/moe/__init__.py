@@ -71,4 +71,10 @@ __all__ = [
     "SUPPORTED_MOE_BACKENDS",
     "OFFLOAD_MOE_BACKENDS",
     "is_offload_moe_backend",
+    "FileExpertSource",
+    "ExpertSourceError",
 ]
+
+# Kept at module bottom to avoid importing torch/file-I/O helpers while the
+# backend registry is initialized by lightweight callers.
+from .expert_source import ExpertSourceError, FileExpertSource  # noqa: E402
