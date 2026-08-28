@@ -74,6 +74,7 @@ __all__ = [
     "FileExpertSource",
     "ExpertSourceError",
     "write_expert_sidecar",
+    "write_expert_sidecar_from_safetensors",
     "adapt_expert_tensor_record",
 ]
 
@@ -84,4 +85,5 @@ from .expert_source import (  # noqa: E402
     FileExpertSource,
     adapt_expert_tensor_record,
     write_expert_sidecar,
+    write_expert_sidecar_from_safetensors,
 )

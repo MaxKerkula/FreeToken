@@ -100,3 +100,48 @@ def test_qwen4_rejects_unknown_active_weight_marker():
         assert "unsupported Qwen4 active-weight format" in str(exc)
     else:
         raise AssertionError("unknown active-weight marker was accepted")
+
+
+def _add_minimal_vision(config: RawConfigShim) -> None:
+    config.vision_config = RawConfigShim(
+        {
+            "depth": 2,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_heads": 4,
+            "num_position_embeddings": 16,
+            "out_hidden_size": 2560,
+            "patch_size": 14,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+            "in_channels": 3,
+            "hidden_act": "gelu",
+            "deepstack_visual_indexes": [0],
+        }
+    )
+
+
+def test_qwen4_text_only_marker_disables_only_marked_artifact_vision():
+    published = _raw_checkpoint_config()
+    _add_minimal_vision(published)
+    parsed = parse_config(published)
+    assert parsed.vision_config is not None
+    assert parsed.image_token_id == 248056
+
+    target = _raw_checkpoint_config()
+    _add_minimal_vision(target)
+    target.freetoken_text_only = "qwen4_text_only_v1"
+    parsed = parse_config(target)
+    assert parsed.vision_config is None
+    assert parsed.image_token_id is None
+
+
+def test_qwen4_rejects_unknown_text_only_marker():
+    config = _raw_checkpoint_config()
+    config.freetoken_text_only = "textish-v0"
+    try:
+        parse_config(config)
+    except ValueError as exc:
+        assert "unsupported freetoken_text_only marker" in str(exc)
+    else:
+        raise AssertionError("unknown text-only marker was accepted")

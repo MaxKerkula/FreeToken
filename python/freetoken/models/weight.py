@@ -241,6 +241,7 @@ def load_weight(
     # deliberately optional so every unmarked checkpoint follows the historical path.
     artifact = load_qwen4_artifact_manifest(model_path)
     if artifact is not None:
+        artifact.verify_active()
         active_path = artifact.active_path
         if active_path.is_file() and active_path.name == "freetoken_weight.json":
             active_path = active_path.parent

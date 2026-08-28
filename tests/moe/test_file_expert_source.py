@@ -202,7 +202,7 @@ def test_file_tier_payload_hash_fails_closed(z_fixture_dir):
         FileExpertSource(path, num_experts=1)
 
 
-def test_file_tier_rejects_cpu_hybrid_and_overlap(z_fixture_dir):
+def test_file_tier_rejects_only_cpu_selected_file_layers(z_fixture_dir):
     path = z_fixture_dir / "experts-L00.nvfp4"
     digest = FileExpertSource.create_synthetic(path, num_experts=1, records=[_record(7)])
     src = FileExpertSource(path, num_experts=1, expected_sha256=digest)
@@ -211,11 +211,17 @@ def test_file_tier_rejects_cpu_hybrid_and_overlap(z_fixture_dir):
 
         for target in ("cpu", "hybrid"):
             cache = OffloadMoeCache(1, 1, 1, torch.device("cpu"), decode_target=target, quant_format="nvfp4")
+            cache.cpu_layer_ids = frozenset({0})
             # Source registration itself fails before any source can be used;
             # a direct call is sufficient to prove the policy and avoids giant
             # synthetic resident allocations in this negative test.
             with pytest.raises(ValueError, match="GPU-only"):
                 cache.set_file_sources({0: src})
+
+        mixed = OffloadMoeCache(2, 1, 1, torch.device("cpu"), decode_target="cpu", quant_format="nvfp4")
+        mixed.cpu_layer_ids = frozenset({1})
+        mixed.set_file_sources({0: src})
+        assert set(mixed.file_sources) == {0}
     finally:
         src.close()
 

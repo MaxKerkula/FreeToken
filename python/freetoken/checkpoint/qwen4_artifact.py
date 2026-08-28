@@ -13,6 +13,7 @@ than silently falling back to a different representation.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,16 @@ PLE_FORMAT = "q3_ple_32"
 EXPERT_FORMAT = "ftexpert1_nvfp4_v1"
 REQUIRED_VOLUME = "Z:"
 MANIFEST_NAME = "manifest.json"
+ACTIVE_TARGET_BYTES = 4_804_403_200
+PLE_TARGET_BYTES = 22_400_107_520
+EXPERT_FILE_BYTES = 1_419_776_000
+EXPERT_LAYERS = 48
+EXPERT_NUM_EXPERTS = 512
+KNOWN_TARGET_BYTES = 95_353_758_720
+FILE_TIER_LAYERS = (0, 1, 2, 3, 4, 5, 42, 43, 44, 45, 46, 47)
+PINNED_SOURCE_REPOSITORY = "RadixArk/Qwen3.8-Flash-Next-NVFP4"
+PINNED_SOURCE_REVISION = "7b719225242aacd3dbd3f9407468c2ee9a9d2594"
+TVM_FFI_PATCH_SHA256 = "889310b8152a147a6552a3e451b3251a7df70cdc8e6e4c1c87c7adf3854182ec"
 
 
 class Qwen4ArtifactError(ValueError):
@@ -51,6 +62,15 @@ def _path_from(root: Path, value: object, *, label: str) -> Path:
     return _resolve_z(candidate, label=label)
 
 
+def _path_within_root(root: Path, value: object, *, label: str) -> Path:
+    path = _path_from(root, value, label=label)
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise Qwen4ArtifactError(f"{label} resolves outside artifact root") from exc
+    return path
+
+
 def _require_mapping(value: object, *, label: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise Qwen4ArtifactError(f"{label} must be an object")
@@ -70,6 +90,48 @@ class ExpertFile:
     path: Path
     bytes: int
     sha256: str
+    source_fingerprint: str
+
+
+@dataclass(frozen=True)
+class ComponentFile:
+    path: Path
+    bytes: int
+    sha256: str
+
+
+def _sha256_file(path: Path, *, chunk_bytes: int = 8 << 20) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(chunk_bytes):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verify_component_file(entry: ComponentFile, *, label: str) -> None:
+    if not entry.path.is_file():
+        raise Qwen4ArtifactError(f"{label} is missing: {entry.path}")
+    actual_bytes = entry.path.stat().st_size
+    if actual_bytes != entry.bytes:
+        raise Qwen4ArtifactError(
+            f"{label} length mismatch: {actual_bytes} != {entry.bytes}"
+        )
+    actual_sha = _sha256_file(entry.path)
+    if actual_sha != entry.sha256:
+        raise Qwen4ArtifactError(f"{label} SHA-256 mismatch")
+
+
+def _component_file(root: Path, path: Path) -> dict[str, Any]:
+    resolved = _resolve_z(path, label="artifact component")
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError as exc:
+        raise Qwen4ArtifactError(f"artifact component resolves outside root: {resolved}") from exc
+    return {
+        "path": relative.as_posix(),
+        "bytes": resolved.stat().st_size,
+        "sha256": _sha256_file(resolved),
+    }
 
 
 @dataclass(frozen=True)
@@ -83,12 +145,15 @@ class Qwen4ArtifactManifest:
     path: Path
     raw: Mapping[str, Any]
     active_path: Path
+    active_files: tuple[ComponentFile, ...]
     ple_manifest_path: Path
     ple_data_bytes: int
     ple_sha256: str
     expert_files: tuple[ExpertFile, ...]
+    metadata_files: tuple[ComponentFile, ...]
     file_tier_layers: tuple[int, ...]
     resident_layers: tuple[int, ...]
+    production_geometry: bool
 
     @property
     def root(self) -> Path:
@@ -143,6 +208,17 @@ class Qwen4ArtifactManifest:
                 return entry
         raise Qwen4ArtifactError(f"manifest has no expert file for layer {layer_id}")
 
+    def verify_active(self) -> None:
+        for index, entry in enumerate(self.active_files):
+            _verify_component_file(entry, label=f"active.files[{index}]")
+        from freetoken.checkpoint.ftw import INDEX_NAME
+
+        with (self.active_path / INDEX_NAME).open("r", encoding="utf-8") as handle:
+            index = json.load(handle)
+        expected = str(self.source["inventory_sha256"]).lower()
+        if str(index.get("source_inventory_sha256", "")).lower() != expected:
+            raise Qwen4ArtifactError("active FTW source inventory fingerprint mismatch")
+
 
 def _validate_layers(value: object, *, label: str) -> tuple[int, ...]:
     if not isinstance(value, list):
@@ -173,7 +249,8 @@ def _read_manifest_path(model_path: str | os.PathLike[str]) -> Path | None:
 
 
 def load_qwen4_artifact_manifest(
-    model_path: str | os.PathLike[str], *, require: bool = False
+    model_path: str | os.PathLike[str], *, require: bool = False,
+    allow_synthetic_geometry: bool = False,
 ) -> Qwen4ArtifactManifest | None:
     """Load and validate a Qwen4 modular manifest.
 
@@ -195,28 +272,105 @@ def load_qwen4_artifact_manifest(
     root = _require_mapping(raw, label="Qwen4 modular manifest")
     if root.get("format") != FORMAT or int(root.get("version", -1)) != VERSION:
         raise Qwen4ArtifactError("unsupported Qwen4 modular manifest format/version")
+    if root.get("artifact_schema") != FORMAT:
+        raise Qwen4ArtifactError("unsupported Qwen4 modular artifact_schema")
     if root.get("text_only") is not True:
         raise Qwen4ArtifactError("Qwen4 modular manifest must declare text_only=true")
+    source = _require_mapping(root.get("source"), label="source")
+    if not str(source.get("repository", "")).strip() or not str(source.get("revision", "")).strip():
+        raise Qwen4ArtifactError("source repository and revision are required")
+    source_inventory_sha256 = _require_sha(
+        source.get("inventory_sha256"), label="source.inventory_sha256"
+    )
+    minimum_commit = str(root.get("minimum_freetoken_commit", "")).lower()
+    if len(minimum_commit) != 40 or any(char not in "0123456789abcdef" for char in minimum_commit):
+        raise Qwen4ArtifactError("minimum_freetoken_commit must be a 40-character Git OID")
+    _require_sha(root.get("tvm_ffi_patch_sha256"), label="tvm_ffi_patch_sha256")
+    if not allow_synthetic_geometry:
+        if source.get("repository") != PINNED_SOURCE_REPOSITORY:
+            raise Qwen4ArtifactError("source repository does not match the pinned production source")
+        if source.get("revision") != PINNED_SOURCE_REVISION:
+            raise Qwen4ArtifactError("source revision does not match the pinned production revision")
+        if str(root.get("tvm_ffi_patch_sha256", "")).lower() != TVM_FFI_PATCH_SHA256:
+            raise Qwen4ArtifactError("TVM-FFI patch does not match the frozen contract")
+    declared_fingerprint = _require_sha(
+        root.get("complete_artifact_fingerprint"), label="complete_artifact_fingerprint"
+    )
+    unsigned = dict(root)
+    unsigned.pop("complete_artifact_fingerprint", None)
+    actual_fingerprint = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if actual_fingerprint != declared_fingerprint:
+        raise Qwen4ArtifactError("complete artifact fingerprint mismatch")
+    metadata = _require_mapping(root.get("metadata"), label="metadata")
+    if not isinstance(metadata.get("files"), list) or not metadata["files"]:
+        raise Qwen4ArtifactError("metadata.files must be a non-empty list")
+    metadata_files: list[ComponentFile] = []
+    for index, item in enumerate(metadata["files"]):
+        entry = _require_mapping(item, label=f"metadata.files[{index}]")
+        component = ComponentFile(
+            path=_path_within_root(
+                path.parent, entry.get("path"), label=f"metadata.files[{index}].path"
+            ),
+            bytes=int(entry.get("bytes", -1)),
+            sha256=_require_sha(
+                entry.get("sha256"), label=f"metadata.files[{index}].sha256"
+            ),
+        )
+        if component.bytes < 0:
+            raise Qwen4ArtifactError("metadata file bytes must be non-negative")
+        _verify_component_file(component, label=f"metadata.files[{index}]")
+        metadata_files.append(component)
 
     active = _require_mapping(root.get("active"), label="active")
     if active.get("format") != ACTIVE_FORMAT:
         raise Qwen4ArtifactError(f"unsupported active format {active.get('format')!r}")
-    active_path = _path_from(path.parent, active.get("path"), label="active.path")
+    active_path = _path_within_root(path.parent, active.get("path"), label="active.path")
     if "bytes" in active and int(active["bytes"]) < 0:
         raise Qwen4ArtifactError("active.bytes must be non-negative")
-    if "sha256" in active:
-        _require_sha(active["sha256"], label="active.sha256")
+    raw_active_files = active.get("files")
+    if not isinstance(raw_active_files, list) or not raw_active_files:
+        raise Qwen4ArtifactError("active.files must be a non-empty list")
+    active_files: list[ComponentFile] = []
+    for index, item in enumerate(raw_active_files):
+        entry = _require_mapping(item, label=f"active.files[{index}]")
+        try:
+            size = int(entry["bytes"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise Qwen4ArtifactError(f"active.files[{index}].bytes must be an integer") from exc
+        if size < 0:
+            raise Qwen4ArtifactError(f"active.files[{index}].bytes must be non-negative")
+        component = ComponentFile(
+            path=_path_within_root(path.parent, entry.get("path"), label=f"active.files[{index}].path"),
+            bytes=size,
+            sha256=_require_sha(entry.get("sha256"), label=f"active.files[{index}].sha256"),
+        )
+        try:
+            component.path.relative_to(active_path)
+        except ValueError as exc:
+            raise Qwen4ArtifactError("active file resolves outside active.path") from exc
+        active_files.append(component)
 
     ple = _require_mapping(root.get("ple"), label="ple")
     if ple.get("format") != PLE_FORMAT:
         raise Qwen4ArtifactError(f"unsupported PLE format {ple.get('format')!r}")
     if str(ple.get("required_volume", REQUIRED_VOLUME)).upper() != REQUIRED_VOLUME:
         raise Qwen4ArtifactError("Qwen4 PLE sidecar must reside on Z:")
-    ple_manifest_path = _path_from(path.parent, ple.get("manifest"), label="ple.manifest")
+    ple_manifest_path = _path_within_root(path.parent, ple.get("manifest"), label="ple.manifest")
     ple_data_bytes = int(ple.get("data_bytes", 0))
     if ple_data_bytes < 0:
         raise Qwen4ArtifactError("ple.data_bytes must be non-negative")
     ple_sha256 = _require_sha(ple.get("sha256"), label="ple.sha256")
+    if not ple_manifest_path.is_file():
+        raise Qwen4ArtifactError(f"PLE manifest is missing: {ple_manifest_path}")
+    try:
+        with ple_manifest_path.open("r", encoding="utf-8") as handle:
+            ple_sidecar_manifest = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise Qwen4ArtifactError("cannot read Q3 PLE manifest") from exc
+    if str(ple_sidecar_manifest.get("source_fingerprint", "")).lower() != source_inventory_sha256:
+        raise Qwen4ArtifactError("Q3 PLE source fingerprint mismatch")
 
     experts = _require_mapping(root.get("experts"), label="experts")
     if experts.get("format") != EXPERT_FORMAT:
@@ -245,26 +399,51 @@ def load_qwen4_artifact_manifest(
         files.append(
             ExpertFile(
                 layer=layer,
-                path=_path_from(path.parent, entry.get("path"), label=f"experts.files[{layer}].path"),
+                path=_path_within_root(path.parent, entry.get("path"), label=f"experts.files[{layer}].path"),
                 bytes=size,
                 sha256=_require_sha(entry.get("sha256"), label=f"experts.files[{layer}].sha256"),
+                source_fingerprint=_require_sha(
+                    entry.get("source_fingerprint"),
+                    label=f"experts.files[{layer}].source_fingerprint",
+                ),
             )
         )
+    if any(item.source_fingerprint != source_inventory_sha256 for item in files):
+        raise Qwen4ArtifactError("expert sidecar source fingerprint mismatch")
     declared_layers = set(file_layers) | set(resident_layers)
     if declared_layers != seen:
         raise Qwen4ArtifactError(
             "experts.files layers must exactly match file_tier_layers + resident_layers"
         )
+    production_geometry = not allow_synthetic_geometry
+    if production_geometry:
+        active_payload = int(active.get("payload_bytes", active.get("bytes", -1)))
+        if active_payload != ACTIVE_TARGET_BYTES:
+            raise Qwen4ArtifactError("active payload does not match frozen production bytes")
+        if ple_data_bytes != PLE_TARGET_BYTES:
+            raise Qwen4ArtifactError("Q3 PLE extent does not match frozen production bytes")
+        if len(files) != EXPERT_LAYERS or any(item.bytes != EXPERT_FILE_BYTES for item in files):
+            raise Qwen4ArtifactError("expert sidecars do not match frozen production geometry")
+        if file_layers != FILE_TIER_LAYERS:
+            raise Qwen4ArtifactError("file-tier layers do not match the frozen production policy")
+        expected_resident = tuple(layer for layer in range(EXPERT_LAYERS) if layer not in FILE_TIER_LAYERS)
+        if resident_layers != expected_resident:
+            raise Qwen4ArtifactError("resident layers do not match the frozen production policy")
+        if active_payload + ple_data_bytes + sum(item.bytes for item in files) != KNOWN_TARGET_BYTES:
+            raise Qwen4ArtifactError("known target component byte reconciliation failed")
     return Qwen4ArtifactManifest(
         path=path,
         raw=root,
         active_path=active_path,
+        active_files=tuple(active_files),
         ple_manifest_path=ple_manifest_path,
         ple_data_bytes=ple_data_bytes,
         ple_sha256=ple_sha256,
         expert_files=tuple(sorted(files, key=lambda item: item.layer)),
+        metadata_files=tuple(metadata_files),
         file_tier_layers=file_layers,
         resident_layers=resident_layers,
+        production_geometry=production_geometry,
     )
 
 
@@ -330,6 +509,7 @@ def build_mixed_expert_sources(
         file_sources[layer] = FileExpertSource(
             entry.path,
             expected_sha256=entry.sha256,
+            expected_source_fingerprint=entry.source_fingerprint,
             expected_layer_id=layer,
             num_experts=num_experts,
             verify_hash=verify_hash,
@@ -337,32 +517,40 @@ def build_mixed_expert_sources(
 
     # Resident layers are bounded by one six-plane record at a time.  We do not
     # retain a second full-layer staging tensor and close each source after fill.
-    for layer in sorted(manifest.resident_layers):
-        entry = manifest.file_for_layer(layer)
-        with FileExpertSource(
-            entry.path,
-            expected_sha256=entry.sha256,
-            expected_layer_id=layer,
-            num_experts=num_experts,
-            verify_hash=verify_hash,
-        ) as source:
-            buffers = {
-                name: allocator(shape=(num_experts, *shape), dtype=dtype)
-                for name, (shape, dtype) in FileExpertSource.plane_specs.items()
-            }
-            for expert_id in range(num_experts):
-                row = source.read_record(expert_id)
+    # If construction fails, close already-open tier sources so partial startup
+    # cannot retain file handles or make fixture cleanup impossible.
+    try:
+        for layer in sorted(manifest.resident_layers):
+            entry = manifest.file_for_layer(layer)
+            with FileExpertSource(
+                entry.path,
+                expected_sha256=entry.sha256,
+                expected_source_fingerprint=entry.source_fingerprint,
+                expected_layer_id=layer,
+                num_experts=num_experts,
+                verify_hash=verify_hash,
+            ) as source:
+                buffers = {
+                    name: allocator(shape=(num_experts, *shape), dtype=dtype)
+                    for name, (shape, dtype) in source.plane_specs.items()
+                }
+                for expert_id in range(num_experts):
+                    row = source.read_record(expert_id)
+                    for name, buffer in buffers.items():
+                        destination = getattr(buffer, "tensor", buffer)
+                        destination[expert_id].copy_(row[name])
+                settle = residency[layer]
+                for buffer in buffers.values():
+                    if settle == HostResidency.PINNED.value and hasattr(buffer, "pin"):
+                        buffer.pin()
+                    elif settle == HostResidency.LOCKED.value and hasattr(buffer, "lock"):
+                        buffer.lock()
                 for name, buffer in buffers.items():
-                    destination = getattr(buffer, "tensor", buffer)
-                    destination[expert_id].copy_(row[name])
-            settle = residency[layer]
-            for buffer in buffers.values():
-                if settle == HostResidency.PINNED.value and hasattr(buffer, "pin"):
-                    buffer.pin()
-                elif settle == HostResidency.LOCKED.value and hasattr(buffer, "lock"):
-                    buffer.lock()
-            for name, buffer in buffers.items():
-                sources[name][layer] = getattr(buffer, "tensor", buffer)
+                    sources[name][layer] = getattr(buffer, "tensor", buffer)
+    except Exception:
+        for source in file_sources.values():
+            source.close()
+        raise
     return sources, file_sources
 
 
@@ -372,6 +560,7 @@ def configure_mixed_expert_sources(
     resident_sources,
     *,
     file_sources: Mapping[int, object] | None = None,
+    layer_residency: list[str] | None = None,
 ):
     """Wire resident bank entries and file-backed layers into an offload cache.
 
@@ -383,8 +572,8 @@ def configure_mixed_expert_sources(
 
     if not isinstance(manifest, Qwen4ArtifactManifest):
         raise TypeError("manifest must be a validated Qwen4ArtifactManifest")
-    if cache.decode_target != "gpu":
-        raise ValueError("Qwen4 modular file tiers are GPU-only")
+    if set(manifest.file_tier_layers) & set(cache.cpu_layer_ids):
+        raise ValueError("Qwen4 modular file-tier layers are GPU-only")
     if cache.prefill_overlap:
         raise ValueError("Qwen4 modular file tiers require prefill_overlap=False")
     # The artifact's native expert geometry is 512 slots.  Enforce this independently
@@ -417,7 +606,7 @@ def configure_mixed_expert_sources(
             if values[layer] is None:
                 raise ValueError(f"resident layer {layer} has no resident source for {name}")
         per_layer[name] = values
-    cache.set_bank_sources(per_layer)
+    cache.set_bank_sources(per_layer, layer_residency=layer_residency)
     from freetoken.moe.expert_source import FileExpertSource
 
     if file_sources is None:
@@ -427,6 +616,7 @@ def configure_mixed_expert_sources(
             source = FileExpertSource(
                 entry.path,
                 expected_sha256=entry.sha256,
+                expected_source_fingerprint=entry.source_fingerprint,
                 expected_layer_id=layer,
                 num_experts=cache.num_experts,
             )
@@ -437,6 +627,257 @@ def configure_mixed_expert_sources(
             raise ValueError("file_sources keys do not match manifest file_tier_layers")
     cache.set_file_sources(dict(file_sources))
     return dict(file_sources)
+
+
+def build_qwen4_modular_artifact(
+    source_path: str | os.PathLike[str],
+    artifact_root: str | os.PathLike[str],
+    *,
+    source_repository: str = PINNED_SOURCE_REPOSITORY,
+    source_revision: str = PINNED_SOURCE_REVISION,
+    source_inventory_sha256: str,
+    minimum_freetoken_commit: str,
+    ple_layer_id: int = 2,
+    ple_split_parts: int = 128,
+    expert_layers: tuple[int, ...] = tuple(range(EXPERT_LAYERS)),
+    file_tier_layers: tuple[int, ...] = FILE_TIER_LAYERS,
+    expert_num_experts: int = EXPERT_NUM_EXPERTS,
+    expert_geometry=None,
+    allow_synthetic_geometry: bool = False,
+) -> dict[str, Any]:
+    """Run the canonical C1-C5 modular conversion sequence.
+
+    C0 (full source-file identity verification) remains a mandatory caller gate.
+    This function performs no network I/O and accepts only an already-local Z:-backed
+    source snapshot.  Each component writer owns its bounded streaming/atomic contract;
+    the final manifest is published only after all components reopen successfully.
+    """
+
+    source = _resolve_z(source_path, label="source checkpoint")
+    root = _resolve_z(artifact_root, label="artifact root")
+    if not source.is_dir():
+        raise Qwen4ArtifactError(f"source checkpoint is not a directory: {source}")
+    root.mkdir(parents=True, exist_ok=True)
+    inventory = _require_sha(source_inventory_sha256, label="source_inventory_sha256")
+
+    from freetoken.checkpoint.convert import convert_checkpoint
+    from freetoken.checkpoint.q3_ple import write_q3_ple_from_safetensors
+    from freetoken.moe.expert_source import write_expert_sidecar_from_safetensors
+
+    active_index = convert_checkpoint(
+        str(source),
+        str(root),
+        artifact_format=ARTIFACT_FORMAT,
+        source_inventory_sha256=inventory,
+    )
+    write_q3_ple_from_safetensors(
+        source,
+        root / "ple-q3-000.bin",
+        root / "ple-q3.json",
+        layer_id=int(ple_layer_id),
+        split_parts=int(ple_split_parts),
+        source_fingerprint=inventory,
+    )
+    expert_paths: dict[int, str] = {}
+    for layer in expert_layers:
+        name = f"experts-L{int(layer):02d}.nvfp4"
+        write_expert_sidecar_from_safetensors(
+            source,
+            root / name,
+            layer_id=int(layer),
+            source_fingerprint=inventory,
+            num_experts=int(expert_num_experts),
+            geometry=expert_geometry,
+        )
+        expert_paths[int(layer)] = name
+    metadata_paths = list(active_index.get("copied_metadata", ()))
+    if not metadata_paths:
+        raise Qwen4ArtifactError("active conversion copied no target metadata")
+    return finalize_qwen4_modular_manifest(
+        root,
+        source_repository=source_repository,
+        source_revision=source_revision,
+        source_inventory_sha256=inventory,
+        minimum_freetoken_commit=minimum_freetoken_commit,
+        tvm_ffi_patch_sha256=TVM_FFI_PATCH_SHA256,
+        expert_paths=expert_paths,
+        file_tier_layers=file_tier_layers,
+        metadata_paths=metadata_paths,
+        expert_num_experts=expert_num_experts,
+        allow_synthetic_geometry=allow_synthetic_geometry,
+    )
+
+
+def finalize_qwen4_modular_manifest(
+    artifact_root: str | os.PathLike[str],
+    *,
+    source_repository: str,
+    source_revision: str,
+    source_inventory_sha256: str,
+    minimum_freetoken_commit: str,
+    tvm_ffi_patch_sha256: str,
+    active_dir: str | os.PathLike[str] = "qwen4-active-v1.ftw",
+    ple_manifest: str | os.PathLike[str] = "ple-q3.json",
+    expert_paths: Mapping[int, str | os.PathLike[str]],
+    file_tier_layers: list[int] | tuple[int, ...],
+    metadata_paths: list[str | os.PathLike[str]],
+    expert_num_experts: int = 512,
+    allow_synthetic_geometry: bool = False,
+) -> dict[str, Any]:
+    """Validate completed components and atomically publish ``manifest.json``.
+
+    This is the final C5 orchestration seam.  It never creates weight payloads;
+    the C2/C3/C4 writers must already have atomically finalized their components.
+    Every file is length/hash inventoried here, the Q3 and FTEXPERT1 readers reopen
+    their formats, and only then is the complete manifest promoted.
+    """
+
+    root = _resolve_z(artifact_root, label="artifact root")
+    root.mkdir(parents=True, exist_ok=True)
+    active_root = _path_from(root, active_dir, label="active_dir")
+    from freetoken.checkpoint.ftw import INDEX_NAME, is_ftw_checkpoint
+
+    if not active_root.is_dir() or not is_ftw_checkpoint(str(active_root)):
+        raise Qwen4ArtifactError(f"active component is not an FTW checkpoint: {active_root}")
+    with (active_root / INDEX_NAME).open("r", encoding="utf-8") as handle:
+        active_index = json.load(handle)
+    inventory_digest = _require_sha(
+        source_inventory_sha256, label="source_inventory_sha256"
+    )
+    if str(active_index.get("source_inventory_sha256", "")).lower() != inventory_digest:
+        raise Qwen4ArtifactError("active FTW source inventory fingerprint mismatch")
+    active_payload_bytes = int(active_index.get("total_bytes", -1))
+    if active_payload_bytes < 0:
+        raise Qwen4ArtifactError("active FTW index has no valid total_bytes")
+    active_files = [
+        _component_file(root, item)
+        for item in sorted(path for path in active_root.rglob("*") if path.is_file())
+    ]
+
+    ple_path = _path_within_root(root, ple_manifest, label="ple_manifest")
+    from freetoken.checkpoint.q3_ple import Q3PLEReader
+
+    with Q3PLEReader(ple_path) as ple_reader:
+        ple_data = ple_reader.data_path
+        ple_data_bytes = ple_data.stat().st_size
+        ple_sha256 = _sha256_file(ple_data)
+        ple_source_fingerprint = str(ple_reader.manifest.get("source_fingerprint", ""))
+        if ple_source_fingerprint.lower() != inventory_digest:
+            raise Qwen4ArtifactError("Q3 PLE source fingerprint mismatch")
+
+    tiered = tuple(sorted(_validate_layers(list(file_tier_layers), label="file_tier_layers")))
+    expert_items: list[dict[str, Any]] = []
+    from freetoken.moe.expert_source import FileExpertSource
+
+    for layer, value in sorted((int(layer), path) for layer, path in expert_paths.items()):
+        expert_path = _path_within_root(root, value, label=f"expert layer {layer}")
+        with FileExpertSource(
+            expert_path,
+            expected_source_fingerprint=inventory_digest,
+            expected_layer_id=layer,
+            num_experts=int(expert_num_experts),
+            verify_hash=True,
+        ) as source:
+            if source.layer_id != layer:
+                raise Qwen4ArtifactError(f"expert sidecar layer mismatch for {expert_path}")
+            expert_items.append(
+                {
+                    "layer": layer,
+                    **_component_file(root, expert_path),
+                    "source_fingerprint": source.source_fingerprint,
+                }
+            )
+    all_layers = tuple(item["layer"] for item in expert_items)
+    if all_layers != tuple(range(len(all_layers))):
+        raise Qwen4ArtifactError("expert sidecars must cover contiguous layers from zero")
+    if not set(tiered) <= set(all_layers):
+        raise Qwen4ArtifactError("file tier contains a layer without an expert sidecar")
+    resident = sorted(set(all_layers) - set(tiered))
+    if not allow_synthetic_geometry:
+        if source_repository != PINNED_SOURCE_REPOSITORY or source_revision != PINNED_SOURCE_REVISION:
+            raise Qwen4ArtifactError("production artifact source pin mismatch")
+        commit = str(minimum_freetoken_commit).lower()
+        if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):
+            raise Qwen4ArtifactError("production artifact requires a concrete FreeToken commit")
+        if str(tvm_ffi_patch_sha256).lower() != TVM_FFI_PATCH_SHA256:
+            raise Qwen4ArtifactError("production artifact TVM-FFI patch mismatch")
+        if int(expert_num_experts) != EXPERT_NUM_EXPERTS:
+            raise Qwen4ArtifactError("production artifact requires 512 experts per layer")
+        if active_payload_bytes != ACTIVE_TARGET_BYTES:
+            raise Qwen4ArtifactError("active FTW does not match frozen production bytes")
+        if ple_data_bytes != PLE_TARGET_BYTES:
+            raise Qwen4ArtifactError("Q3 PLE does not match frozen production extent")
+        if tuple(all_layers) != tuple(range(EXPERT_LAYERS)):
+            raise Qwen4ArtifactError("production artifact requires 48 expert sidecars")
+        if any(item["bytes"] != EXPERT_FILE_BYTES for item in expert_items):
+            raise Qwen4ArtifactError("expert sidecar does not match frozen production bytes")
+        if tiered != FILE_TIER_LAYERS:
+            raise Qwen4ArtifactError("file tier does not match the frozen production policy")
+        if active_payload_bytes + ple_data_bytes + sum(item["bytes"] for item in expert_items) != KNOWN_TARGET_BYTES:
+            raise Qwen4ArtifactError("known target component byte reconciliation failed")
+
+    metadata_files = [
+        _component_file(root, _path_within_root(root, value, label="metadata file"))
+        for value in metadata_paths
+    ]
+    if not any(item["path"] == "config.json" for item in metadata_files):
+        raise Qwen4ArtifactError("modular artifact metadata must include config.json")
+    config_path = root / "config.json"
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    if config.get("freetoken_text_only") != TEXT_ONLY_MARKER:
+        raise Qwen4ArtifactError("config.json lacks the accepted text-only marker")
+    if config.get("freetoken_active_quant") != ACTIVE_FORMAT:
+        raise Qwen4ArtifactError("config.json lacks the accepted active-quant marker")
+
+    manifest: dict[str, Any] = {
+        "format": FORMAT,
+        "version": VERSION,
+        "artifact_schema": FORMAT,
+        "text_only": True,
+        "source": {
+            "repository": str(source_repository),
+            "revision": str(source_revision),
+            "inventory_sha256": inventory_digest,
+        },
+        "minimum_freetoken_commit": str(minimum_freetoken_commit),
+        "tvm_ffi_patch_sha256": _require_sha(
+            tvm_ffi_patch_sha256, label="tvm_ffi_patch_sha256"
+        ),
+        "active": {
+            "format": ACTIVE_FORMAT,
+            "path": active_root.relative_to(root).as_posix(),
+            "payload_bytes": active_payload_bytes,
+            "physical_file_bytes": sum(item["bytes"] for item in active_files),
+            "files": active_files,
+        },
+        "ple": {
+            "format": PLE_FORMAT,
+            "manifest": ple_path.relative_to(root).as_posix(),
+            "data_bytes": ple_data_bytes,
+            "sha256": ple_sha256,
+            "source_fingerprint": ple_source_fingerprint,
+            "required_volume": REQUIRED_VOLUME,
+        },
+        "experts": {
+            "format": EXPERT_FORMAT,
+            "files": expert_items,
+            "file_tier_layers": list(tiered),
+            "resident_layers": resident,
+            "required_volume": REQUIRED_VOLUME,
+        },
+        "metadata": {"files": metadata_files},
+    }
+    canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    manifest["complete_artifact_fingerprint"] = hashlib.sha256(canonical).hexdigest()
+    partial = root / f".{MANIFEST_NAME}.partial-{os.getpid()}"
+    with partial.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(partial, root / MANIFEST_NAME)
+    return manifest
 
 
 __all__ = [
@@ -450,8 +891,10 @@ __all__ = [
     "Qwen4ArtifactManifest",
     "TEXT_ONLY_MARKER",
     "VERSION",
+    "build_qwen4_modular_artifact",
     "configure_mixed_expert_sources",
     "build_mixed_expert_sources",
+    "finalize_qwen4_modular_manifest",
     "load_qwen4_artifact_manifest",
     "qwen4_text_only_marker",
 ]

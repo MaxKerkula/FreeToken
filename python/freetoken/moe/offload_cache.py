@@ -365,8 +365,15 @@ class OffloadMoeCache:
         resident host tensors and CUDA graph capture cannot contain synchronous
         file I/O.
         """
-        if self.decode_target != "gpu":
-            raise ValueError("file-backed expert tiers are GPU-only; use resident HostBanks for CPU/hybrid")
+        # A mixed cache may use the CPU executor for selected resident layers,
+        # but a file-backed layer itself is always GPU-only.  The per-layer set is
+        # the precise invariant; rejecting the entire cache would unnecessarily
+        # disable existing CPU/hybrid support for resident HostBanks.
+        requested = {int(layer) for layer in sources}
+        if requested & set(self.cpu_layer_ids):
+            raise ValueError(
+                "file-backed expert tiers are GPU-only; CPU/hybrid layers must be resident"
+            )
         if self.prefill_overlap:
             raise ValueError("file-backed expert tiers require prefill_overlap=False")
         if not sources:

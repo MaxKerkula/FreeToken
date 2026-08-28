@@ -790,7 +790,11 @@ class Qwen4ExpModel(BaseOP):
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         hidden = self.embed_tokens.forward(input_ids)
         mm_embeds = getattr(get_global_ctx().batch, "mm_embeds", None)
-        if mm_embeds is not None and self._image_token_id is not None:
+        if mm_embeds is not None and self._image_token_id is None:
+            raise RuntimeError(
+                "image inputs are not supported by this text-only Qwen4 modular artifact"
+            )
+        if mm_embeds is not None:
             mask = input_ids == self._image_token_id
             slots = int(mask.sum().item())
             if slots != mm_embeds.shape[0]:

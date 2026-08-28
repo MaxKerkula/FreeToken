@@ -114,7 +114,9 @@ def _copy_host_mapped_weights(model_path: str, out_dir: str) -> list[str]:
     return copied
 
 
-def _copy_metadata(model_path: str, out_dir: str) -> list[str]:
+def _copy_metadata(
+    model_path: str, out_dir: str, *, include_host_mapped_weights: bool = True
+) -> list[str]:
     """Copy all non-weight files (config, tokenizer, remote-code, nested model configs)
     preserving directory structure, so the FTW dir is a self-contained checkpoint."""
     if os.path.isfile(model_path):
@@ -148,8 +150,20 @@ def _copy_metadata(model_path: str, out_dir: str) -> list[str]:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copy2(src, dst)
             copied.append(rel)
-    copied.extend(_copy_host_mapped_weights(model_path, out_dir))
+    if include_host_mapped_weights:
+        copied.extend(_copy_host_mapped_weights(model_path, out_dir))
     return copied
+
+
+def _iter_qwen4_modular_dense_entries(entries):
+    """Apply the frozen active map and text-only filtering to a source stream."""
+    from freetoken.models.config import VISION_KEY_PREFIXES
+    from freetoken.models.qwen4_exp.weight import iter_active_nvfp4_runtime_entries
+
+    for name, tensor in iter_active_nvfp4_runtime_entries(entries):
+        if name.startswith(("visual.",) + VISION_KEY_PREFIXES):
+            continue
+        yield name, tensor
 
 
 class _ConvertSink:
@@ -218,6 +232,7 @@ def convert_checkpoint(
     shard_limit: int = DEFAULT_SHARD_LIMIT,
     device: str | None = None,
     artifact_format: str | None = None,
+    source_inventory_sha256: str | None = None,
 ) -> dict:
     """Write ``model_path`` as an FTW checkpoint at ``out_dir``. Returns the index dict.
 
@@ -240,26 +255,45 @@ def convert_checkpoint(
             f"FTW conversion runs single-process and the format records no TP layout, "
             f"but TP is already set to size={tp.size}"
         )
-    dev = torch.device(device or "cuda:0")
-    torch.cuda.set_device(dev)
-    torch.zeros(1, device=dev)  # init CUDA context (needed by nvfp4 backend pick / pinning)
-
-    cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(tp.rank, tp.size),
-                       dtype=dtype, moe_backend=moe_backend)
-    mc = cfg.model_config
     if artifact_format not in (None, "qwen4_modular_v1"):
         raise ValueError(
             f"unsupported artifact_format {artifact_format!r}; expected None or 'qwen4_modular_v1'"
         )
+    # The modular target is pre-encoded entirely on CPU.  It deliberately omits
+    # expert banks from this active FTW component, so initializing CUDA here would
+    # add an unnecessary conversion dependency and obscure the zero-VRAM envelope.
+    dev = torch.device("cpu" if artifact_format == "qwen4_modular_v1" else (device or "cuda:0"))
+    if dev.type == "cuda":
+        torch.cuda.set_device(dev)
+        torch.zeros(1, device=dev)  # needed by legacy expert backend selection / pinning
+
+    cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(tp.rank, tp.size),
+                       dtype=dtype, moe_backend=moe_backend)
+    mc = cfg.model_config
     is_qwen4 = any("Qwen4" in str(arch) for arch in getattr(mc, "architectures", ()))
     if artifact_format is not None and not is_qwen4:
         raise ValueError("artifact_format='qwen4_modular_v1' requires a Qwen4 checkpoint")
-    offload = moe_backend == "offload" and getattr(mc, "is_moe", False)
-    include_moe_experts = not offload
+    modular = artifact_format == "qwen4_modular_v1"
+    if modular:
+        source_inventory_sha256 = str(source_inventory_sha256 or "").lower()
+        if len(source_inventory_sha256) != 64 or any(
+            char not in "0123456789abcdef" for char in source_inventory_sha256
+        ):
+            raise ValueError(
+                "qwen4_modular_v1 conversion requires source_inventory_sha256"
+            )
+    offload = not modular and moe_backend == "offload" and getattr(mc, "is_moe", False)
+    include_moe_experts = False if modular else not offload
 
     from freetoken.utils.progress import byte_bar, count_bar
 
-    writer = FTWWriter(out_dir, shard_limit=shard_limit)
+    # For the modular target ``out_dir`` is the artifact root; active FTW bytes
+    # live in their own component directory while config/tokenizer metadata stays
+    # at the root used by normal Engine startup.
+    active_out_dir = (
+        os.path.join(out_dir, "qwen4-active-v1.ftw") if modular else out_dir
+    )
+    writer = FTWWriter(active_out_dir, shard_limit=shard_limit)
     n_weight = n_bank = n_alpha = 0
 
     # 1) dense weights (host tensors; load straight to CPU to avoid GPU pressure)
@@ -275,20 +309,7 @@ def convert_checkpoint(
         # fallback.  The Qwen4 iterator has already fused canonical projections; this
         # wrapper only converts the frozen active map while leaving routers, PLE, and
         # all non-active entries untouched.
-        from freetoken.models.qwen4_exp.weight import iter_active_nvfp4_runtime_entries
-
-        def _modular_dense_entries():
-            from freetoken.models.config import VISION_KEY_PREFIXES
-
-            for name, tensor in iter_active_nvfp4_runtime_entries(dense_entries):
-                # The modular target is text-only by contract.  Qwen4's canonical
-                # rename uses ``visual.*`` while other wrappers retain the generic
-                # vision prefixes; drop both explicitly at conversion time.
-                if name.startswith(("visual.",) + VISION_KEY_PREFIXES):
-                    continue
-                yield name, tensor
-
-        dense_entries = _modular_dense_entries()
+        dense_entries = _iter_qwen4_modular_dense_entries(dense_entries)
     for name, tensor in count_bar(dense_entries,
                                   "Converting dense weights"):
         writer.add_tensor(name, tensor, kind="weight")
@@ -355,7 +376,11 @@ def convert_checkpoint(
             bar.close()
 
     _progress("finalize")  # writing shard index + copying config/tokenizer
-    copied = _copy_metadata(model_path, out_dir)
+    copied = _copy_metadata(
+        model_path,
+        out_dir,
+        include_host_mapped_weights=artifact_format != "qwen4_modular_v1",
+    )
     if artifact_format == "qwen4_modular_v1":
         config_path = os.path.join(out_dir, "config.json")
         if not os.path.isfile(config_path):
@@ -378,6 +403,7 @@ def convert_checkpoint(
     index = writer.finalize({
         "source_model_path": os.path.abspath(model_path),
         "fingerprint": fingerprint,
+        "source_inventory_sha256": source_inventory_sha256 if modular else None,
         # quant_format records the actual on-disk bank layout (e.g. nvfp4_marlin vs
         # nvfp4_b12x): the suffix is a runtime backend pick (GPU capability / env), NOT in
         # config, and the stored bytes are physically repacked into it -- so it's kept and

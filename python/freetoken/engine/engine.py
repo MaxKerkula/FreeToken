@@ -517,24 +517,60 @@ class Engine:
 
         artifact = load_qwen4_artifact_manifest(config.model_path)
         if artifact is not None:
-            if config.moe_backend != "offload":
+            if config.moe_backend not in ("offload",):
                 raise ValueError(
-                    "Qwen4 modular expert tiers are GPU-only; use --moe-backend offload"
+                    "Qwen4 modular file tiers require --moe-backend offload; "
+                    "CPU execution may be selected only for resident layers"
                 )
             if config.moe_prefill_overlap:
                 object.__setattr__(config, "moe_prefill_overlap", False)
             # Expert sidecars are authoritative for both tiers.  Resident layers are
             # streamed one record at a time into HostBanks; file layers remain open
             # FileExpertSource readers and never materialize a full layer.
+            from freetoken.moe.host_banks import HostResidency
+            from freetoken.moe.offload_cache import _BANK_BYTES_PER_EXPERT
+
+            cpu_layer_ids = _resolve_cpu_layers(config, artifact.num_layers)
+            tiered = set(artifact.file_tier_layers)
+            if cpu_layer_ids & tiered:
+                raise ValueError(
+                    "--moe-cpu-layers selects a file-tier layer; only resident layers "
+                    "are CPU/hybrid eligible"
+                )
+            resident = set(artifact.resident_layers)
+            pin_budget = _pin_budget_bytes()
+            if pin_budget is not None:
+                row_bytes = _BANK_BYTES_PER_EXPERT["nvfp4"](
+                    config.model_config.hidden_size,
+                    config.model_config.moe_intermediate_size,
+                )
+                max_pinned = pin_budget // (row_bytes * config.model_config.num_experts)
+                required_locked = max(0, len(resident - set(cpu_layer_ids)) - max_pinned)
+                if required_locked:
+                    if not _cpu_moe_executor_viable(config.model_config):
+                        raise ValueError(
+                            "resident expert banks exceed the Windows pin budget and the "
+                            "CPU executor is unavailable; refusing pageable GPU sources"
+                        )
+                    # Deterministic outer-to-inner choice within the resident set.
+                    candidates = sorted(
+                        resident - set(cpu_layer_ids),
+                        key=lambda layer: (min(layer, artifact.num_layers - 1 - layer), layer),
+                    )
+                    cpu_layer_ids = frozenset(set(cpu_layer_ids) | set(candidates[:required_locked]))
+            residency = [HostResidency.PINNED.value] * artifact.num_layers
+            for layer in cpu_layer_ids:
+                residency[layer] = HostResidency.LOCKED.value
+
             resident_sources, file_sources = build_mixed_expert_sources(
                 artifact,
                 num_experts=config.model_config.num_experts,
-                resident_residency=["pinned"] * artifact.num_layers,
+                resident_residency=residency,
                 verify_hash=not config.use_dummy_weight,
             )
             from freetoken.moe.expert_banks import ExpertBanks
 
-            banks = ExpertBanks("nvfp4", resident_sources)
+            banks = ExpertBanks("nvfp4", resident_sources, layer_residency=residency)
             if config.moe_cache_auto:
                 size, pages, _overlap = self._resolve_auto_moe_cache_size(config, banks)
                 object.__setattr__(config, "moe_cache_size", max(size, 512))
@@ -550,17 +586,23 @@ class Engine:
                 prefill_overlap=False,
                 prefill_hit_d2d=False,
                 quant_format=banks.quant_format,
-                decode_target="gpu",
+                decode_target="cpu" if cpu_layer_ids else "gpu",
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
             )
-            cache.cpu_layer_ids = frozenset()
+            cache.cpu_layer_ids = cpu_layer_ids
             configure_mixed_expert_sources(
-                cache, artifact, banks.sources, file_sources=file_sources
+                cache,
+                artifact,
+                banks.sources,
+                file_sources=file_sources,
+                layer_residency=residency,
             )
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
             cache.collect_stats = config.moe_collect_stats
             layers = attach_offload_moe_cache(self.model, cache)
             assert len(layers) == config.model_config.num_moe_layers
+            if cache.decode_target == "cpu":
+                self._init_cpu_moe_executor(config, cache, layers)
             self.ctx.moe_offload_cache = cache
             self.moe_offload_cache = cache
             return cache

@@ -14,6 +14,7 @@ from freetoken.moe.expert_source import (
     MAGIC,
     adapt_expert_tensor_record,
     write_expert_sidecar,
+    write_expert_sidecar_from_safetensors,
 )
 
 
@@ -68,7 +69,7 @@ def test_writer_reduced_geometry_reopens_and_is_deterministic(z_dir):
     assert result["format"] == "FTEXPERT1"
     assert result["raw_record_bytes"] == 66
     assert result["record_bytes"] == 4096
-    assert result["sample_ids"] == (0, 2)
+    assert result["sample_ids"] == (0, 1, 2)
     assert first.read_bytes() == second.read_bytes()
     assert result["sha256"] == hashlib.sha256(first.read_bytes()).hexdigest()
     assert result["sha256"] == result_copy["sha256"]
@@ -91,6 +92,37 @@ def test_source_tensor_adapter_validates_twelve_names_and_expands_globals(z_dir)
     )
     with FileExpertSource(result["path"], num_experts=1) as source:
         assert source.read_record(0)["gate_up_packed"].flatten()[0].item() == 9
+
+
+def test_production_writer_streams_indexed_safetensor_experts(z_dir):
+    import json
+    from safetensors.torch import save_file
+
+    prefix = "model.language_model.layers.3.mlp.experts"
+    tensors = {}
+    weight_map = {}
+    for expert_id in range(2):
+        for suffix, tensor in _source_record(5 + expert_id).items():
+            name = f"{prefix}.{expert_id}.{suffix}"
+            tensors[name] = tensor
+            weight_map[name] = "layer-3.safetensors"
+    save_file(tensors, z_dir / "layer-3.safetensors")
+    (z_dir / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map}), encoding="utf-8"
+    )
+    output = z_dir / "experts-L03.nvfp4"
+    result = write_expert_sidecar_from_safetensors(
+        z_dir,
+        output,
+        layer_id=3,
+        source_fingerprint="a" * 64,
+        num_experts=2,
+        geometry=_geometry(),
+    )
+    assert result["sample_ids"] == (0, 1)
+    with FileExpertSource(output, num_experts=2, expected_layer_id=3) as source:
+        assert int(source.read_record(0)["gate_up_packed"][0, 0]) == 5
+        assert int(source.read_record(1)["down_packed"][0, 0]) == 6
 
 
 def test_writer_accepts_explicit_id_and_named_pairs(z_dir):

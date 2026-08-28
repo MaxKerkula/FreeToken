@@ -60,6 +60,9 @@ def _z_output_path(path: str | os.PathLike[str]) -> Path:
     candidate = Path(path).expanduser()
     if not candidate.is_absolute():
         raise ValueError(f"Q3_PLE_32 output path must be absolute: {path}")
+    lexical_drive, _ = os.path.splitdrive(str(candidate))
+    if lexical_drive.upper() != "Z:" and not str(candidate).lower().startswith("/z/"):
+        raise ValueError(f"Q3_PLE_32 output must resolve to Z:, got {candidate}")
     parent = candidate.parent.resolve(strict=True)
     resolved = parent / candidate.name
     drive, _ = os.path.splitdrive(str(resolved))
@@ -306,10 +309,15 @@ class Q3PLEReader:
     def _validate_segments(self) -> None:
         expected_row = 0
         previous_end = 0
+        contiguous = self.manifest.get("storage_layout") == "contiguous_rows_v1"
         for segment in self.segments:
             if segment.first_row != expected_row or segment.end_row <= segment.first_row:
                 raise ValueError("Q3_PLE_32 segment rows have a gap, overlap, or bad order")
-            if segment.data_offset < 0 or segment.data_offset % ALIGN:
+            if segment.data_offset < 0:
+                raise ValueError("Q3_PLE_32 segment data offset is negative")
+            if contiguous and segment.data_offset != previous_end:
+                raise ValueError("Q3_PLE_32 contiguous segment directory has a gap or overlap")
+            if not contiguous and segment.data_offset % ALIGN:
                 raise ValueError("Q3_PLE_32 segment data offset is not 4 KiB aligned")
             if segment.byte_length != segment.rows * ROW_BYTES:
                 raise ValueError("Q3_PLE_32 segment byte length does not match rows")
@@ -449,11 +457,11 @@ def _validate_segment_directory(
         digest = str(segment["sha256"])
         if first_row != expected_row or end_row <= first_row:
             raise ValueError("Q3_PLE_32 writer generated a malformed segment directory")
-        if data_offset < 0 or data_offset % ALIGN:
-            raise ValueError("Q3_PLE_32 writer generated an unaligned segment")
+        if data_offset != previous_end:
+            raise ValueError("Q3_PLE_32 writer generated a non-contiguous segment")
         if byte_length != (end_row - first_row) * ROW_BYTES:
             raise ValueError("Q3_PLE_32 writer generated a segment length mismatch")
-        if data_offset < previous_end or data_offset + byte_length > file_bytes:
+        if data_offset + byte_length > file_bytes:
             raise ValueError("Q3_PLE_32 writer generated overlapping/out-of-range segments")
         if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
             raise ValueError("Q3_PLE_32 writer generated a malformed segment hash")
@@ -483,9 +491,9 @@ def write_q3_ple_sidecar(
     """Stream rows into an atomic, reader-compatible Q3_PLE_32 sidecar.
 
     ``rows`` is consumed exactly once and only the current 160-value row is held
-    in memory.  Segments are split in source order and begin at 4 KiB-aligned
-    offsets; alignment bytes are included in the whole-file hash but never in a
-    segment's logical length/hash.  Both files are written under unique partial
+    in memory.  Segments are logical hash/addressing ranges over one contiguous
+    row stream.  There is no inter-row or inter-segment padding: the production
+    table is exactly ``rows * 70`` bytes.  Both files are written under unique partial
     names, fsynced, and atomically renamed into place on successful completion.
 
     The converter rule is intentionally fixed at two least-squares refinement
@@ -527,18 +535,6 @@ def write_q3_ple_sidecar(
     current_segment: dict[str, int | str] | None = None
     segment_digest: hashlib._Hash | None = None
 
-    def write_padding(handle: object, count: int) -> None:
-        if count <= 0:
-            return
-        padding = bytes(min(1 << 20, count))
-        remaining = count
-        while remaining:
-            take = min(remaining, len(padding))
-            chunk = padding[:take]
-            handle.write(chunk)  # type: ignore[attr-defined]
-            whole_digest.update(chunk)
-            remaining -= take
-
     try:
         with data_partial.open("wb") as output:
             for source_row in rows:
@@ -556,9 +552,6 @@ def write_q3_ple_sidecar(
                         )
                         current_segment["sha256"] = segment_digest.hexdigest()
                         segments.append(current_segment)
-                    aligned_offset = _align_up(file_offset)
-                    write_padding(output, aligned_offset - file_offset)
-                    file_offset = aligned_offset
                     current_segment = {
                         "first_row": rows_written,
                         "end_row": rows_written,
@@ -615,6 +608,7 @@ def write_q3_ple_sidecar(
         "rows": rows_written,
         "payload_bytes": rows_written * ROW_BYTES,
         "file_bytes": file_bytes,
+        "storage_layout": "contiguous_rows_v1",
         "data_file": os.path.relpath(data_final, manifest_final.parent),
         "weight_scale": global_scale,
         "source_fingerprint": source_digest,
@@ -636,6 +630,75 @@ def write_q3_ple_sidecar(
     return manifest
 
 
+def write_q3_ple_from_safetensors(
+    model_path: str | os.PathLike[str],
+    data_path: str | os.PathLike[str],
+    manifest_path: str | os.PathLike[str],
+    *,
+    layer_id: int,
+    split_parts: int,
+    source_fingerprint: str,
+    rows_per_chunk: int = 8192,
+    segment_rows: int = DEFAULT_SEGMENT_ROWS,
+) -> dict:
+    """Stream the official FP8 PLE shards into the native Q3 sidecar.
+
+    Shards and rows are consumed in exact ``shard_0..shard_N`` order.  A
+    Safetensors slice is read in bounded row chunks; the full 51.2-GiB table is
+    never materialized.  The source per-model ``weight_scale`` remains a separate
+    scalar in the Q3 manifest and is not folded into block scales.
+    """
+
+    folder = Path(model_path).expanduser().resolve()
+    if not folder.is_dir():
+        raise ValueError(f"Q3 PLE source must be a local checkpoint directory: {folder}")
+    if rows_per_chunk <= 0 or split_parts <= 0:
+        raise ValueError("rows_per_chunk and split_parts must be positive")
+    index_path = folder / "model.safetensors.index.json"
+    with index_path.open("r", encoding="utf-8") as handle:
+        weight_map = json.load(handle)["weight_map"]
+    prefix = (
+        f"model.language_model.layers.{int(layer_id)}.ple.ple_embedding."
+        "ngram_embedding"
+    )
+    shard_keys = [f"{prefix}.shard_{part}.weight" for part in range(int(split_parts))]
+    missing = [key for key in shard_keys if key not in weight_map]
+    scale_key = prefix + ".weight_scale"
+    if missing or scale_key not in weight_map:
+        raise ValueError(f"incomplete PLE source mapping under {prefix}")
+
+    import safetensors
+
+    scale_file = folder / weight_map[scale_key]
+    with safetensors.safe_open(scale_file, framework="pt", device="cpu") as handle:
+        scale = handle.get_tensor(scale_key).reshape(())
+    weight_scale = float(scale.float().item())
+
+    def iter_rows():
+        for key in shard_keys:
+            source_file = folder / weight_map[key]
+            with safetensors.safe_open(source_file, framework="pt", device="cpu") as handle:
+                sliced = handle.get_slice(key)
+                shape = tuple(int(value) for value in sliced.get_shape())
+                if len(shape) != 2 or shape[1] != ROW_VALUES:
+                    raise ValueError(f"unexpected PLE source shape for {key}: {shape}")
+                for start in range(0, shape[0], int(rows_per_chunk)):
+                    chunk = sliced[start : min(start + int(rows_per_chunk), shape[0])]
+                    if chunk.dtype != torch.float8_e4m3fn:
+                        raise ValueError(f"unexpected PLE source dtype for {key}: {chunk.dtype}")
+                    for row in chunk.float():
+                        yield row
+
+    return write_q3_ple_sidecar(
+        iter_rows(),
+        data_path,
+        manifest_path,
+        source_fingerprint=source_fingerprint,
+        weight_scale=weight_scale,
+        segment_rows=segment_rows,
+    )
+
+
 __all__ = [
     "ALIGN",
     "BLOCK_BYTES",
@@ -651,4 +714,5 @@ __all__ = [
     "quantize_block",
     "quantize_row",
     "write_q3_ple_sidecar",
+    "write_q3_ple_from_safetensors",
 ]

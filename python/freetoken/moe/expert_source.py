@@ -10,6 +10,7 @@ is detected before the first request is served.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import struct
 import threading
@@ -506,6 +507,8 @@ def write_expert_sidecar(
         partial.unlink()
     payload_hash = hashlib.sha256()
     seen: set[int] = set()
+    sample_ids = tuple(sorted({0, num_experts - 1, num_experts // 4, num_experts // 2, (3 * num_experts) // 4}))
+    sample_raw: dict[int, bytes] = {}
     try:
         with partial.open("wb") as handle:
             header = bytearray(HEADER_BYTES)
@@ -543,6 +546,8 @@ def write_expert_sidecar(
                     raise TypeError(f"expert {expert_id} must be a plane mapping or raw bytes")
                 if len(raw) != raw_record_bytes:
                     raise ValueError(f"expert {expert_id} serialized length {len(raw)} != {raw_record_bytes}")
+                if expert_id in sample_ids:
+                    sample_raw[expert_id] = raw
                 padded = raw + b"\0" * (record_bytes - raw_record_bytes)
                 payload_hash.update(padded)
                 handle.write(padded)
@@ -575,6 +580,21 @@ def write_expert_sidecar(
             pass
         raise
     whole = _sha256_path(destination)
+    # Reopen through the production reader and byte-compare deterministic sample
+    # records before reporting the sidecar complete.  The bounded sample set is
+    # at most five native records (~13.3 MiB at real geometry).
+    with FileExpertSource(
+        destination,
+        expected_sha256=whole,
+        expected_source_fingerprint=fingerprint,
+        expected_layer_id=layer_id,
+        num_experts=num_experts,
+        verify_hash=True,
+    ) as source:
+        for expert_id in sample_ids:
+            actual = _record_from_planes(source.read_record(expert_id), specs)
+            if actual != sample_raw[expert_id]:
+                raise ExpertSourceError(f"expert {expert_id} failed writer reopen verification")
     return {
         "path": str(destination),
         "format": "FTEXPERT1",
@@ -589,8 +609,86 @@ def write_expert_sidecar(
         "canonical_sha256": canonical,
         "whole_sha256": whole,
         "sha256": whole,
-        "sample_ids": (0, num_experts - 1),
+        "sample_ids": sample_ids,
     }
+
+
+def write_expert_sidecar_from_safetensors(
+    model_path: str | os.PathLike[str],
+    path: str | os.PathLike[str],
+    *,
+    layer_id: int,
+    source_fingerprint: str | bytes,
+    num_experts: int = NUM_EXPERTS,
+    geometry: Mapping[str, Any] | Sequence[tuple[str, Any, Any]] | None = None,
+) -> dict[str, Any]:
+    """Stream one official ModelOpt NVFP4 layer into ``FTEXPERT1``.
+
+    The source index must contain exactly twelve tensors for every expert.  Only
+    one expert's tensors and one Safetensors mapping remain live at a time; no
+    full layer or bank is materialized in Python memory.
+    """
+
+    folder = Path(model_path).expanduser().resolve()
+    if not folder.is_dir():
+        raise ValueError(f"expert source must be a local checkpoint directory: {folder}")
+    index_path = folder / "model.safetensors.index.json"
+    with index_path.open("r", encoding="utf-8") as handle:
+        weight_map = json.load(handle)["weight_map"]
+    prefix = f"model.language_model.layers.{int(layer_id)}.mlp.experts."
+    suffixes = tuple(
+        f"{projection}.{field}"
+        for projection in ("gate_proj", "up_proj", "down_proj")
+        for field in ("weight", "weight_scale", "weight_scale_2", "input_scale")
+    )
+    expected = {
+        f"{prefix}{expert_id}.{suffix}"
+        for expert_id in range(int(num_experts))
+        for suffix in suffixes
+    }
+    actual = {name for name in weight_map if name.startswith(prefix)}
+    missing = expected - actual
+    unexpected = actual - expected
+    if missing or unexpected:
+        raise ValueError(
+            f"expert layer {layer_id} tensor set mismatch: "
+            f"missing={len(missing)} unexpected={len(unexpected)}"
+        )
+
+    import safetensors
+
+    def iter_records():
+        current_file: str | None = None
+        current_context = None
+        current_handle = None
+        try:
+            for expert_id in range(int(num_experts)):
+                record = {}
+                for suffix in suffixes:
+                    full_name = f"{prefix}{expert_id}.{suffix}"
+                    filename = weight_map[full_name]
+                    if filename != current_file:
+                        if current_context is not None:
+                            current_context.__exit__(None, None, None)
+                        current_context = safetensors.safe_open(
+                            folder / filename, framework="pt", device="cpu"
+                        )
+                        current_handle = current_context.__enter__()
+                        current_file = filename
+                    record[suffix] = current_handle.get_tensor(full_name)
+                yield expert_id, record
+        finally:
+            if current_context is not None:
+                current_context.__exit__(None, None, None)
+
+    return write_expert_sidecar(
+        path,
+        iter_records(),
+        layer_id=layer_id,
+        source_fingerprint=source_fingerprint,
+        num_experts=num_experts,
+        geometry=geometry,
+    )
 
 
 class FileExpertSource:

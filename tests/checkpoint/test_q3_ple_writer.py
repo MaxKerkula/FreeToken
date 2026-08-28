@@ -9,6 +9,7 @@ from uuid import uuid4
 from pathlib import Path
 
 import pytest
+import torch
 
 from freetoken.checkpoint.q3_ple import (
     ALIGN,
@@ -17,6 +18,7 @@ from freetoken.checkpoint.q3_ple import (
     ROW_VALUES,
     Q3PLEReader,
     quantize_block,
+    write_q3_ple_from_safetensors,
     write_q3_ple_sidecar,
 )
 
@@ -72,7 +74,9 @@ def test_writer_matches_reference_vectors_and_reader(z_fixture_dir: Path) -> Non
     assert manifest["payload_bytes"] == 5 * ROW_BYTES
     assert manifest["file_bytes"] == data_path.stat().st_size
     assert [segment["first_row"] for segment in manifest["segments"]] == [0, 2, 4]
-    assert [segment["data_offset"] for segment in manifest["segments"]] == [0, ALIGN, ALIGN * 2]
+    assert manifest["storage_layout"] == "contiguous_rows_v1"
+    assert manifest["file_bytes"] == manifest["payload_bytes"] == 5 * ROW_BYTES
+    assert [segment["data_offset"] for segment in manifest["segments"]] == [0, 2 * ROW_BYTES, 4 * ROW_BYTES]
     assert all(
         segment["byte_length"] == (2 if segment["first_row"] < 4 else 1) * ROW_BYTES
         for segment in manifest["segments"]
@@ -153,12 +157,54 @@ def test_writer_rejects_bad_integrity_metadata(z_fixture_dir: Path, kwargs: dict
         )
 
 
-def test_writer_requires_z_backing(tmp_path: Path) -> None:
+def test_writer_requires_z_backing() -> None:
+    forbidden = Path("C:/stage7-q3-writer-must-not-create")
     with pytest.raises(ValueError, match="Z:"):
         write_q3_ple_sidecar(
             _rows(1),
-            tmp_path / "ple-q3.bin",
-            tmp_path / "ple-q3.json",
+            forbidden / "ple-q3.bin",
+            forbidden / "ple-q3.json",
             source_fingerprint="d" * 64,
             weight_scale=1.0,
         )
+
+
+def test_production_writer_streams_safetensor_shards_in_source_order(z_fixture_dir: Path) -> None:
+    from safetensors.torch import save_file
+
+    prefix = "model.language_model.layers.2.ple.ple_embedding.ngram_embedding"
+    weight_map = {}
+    source_rows = []
+    for part in range(2):
+        key = f"{prefix}.shard_{part}.weight"
+        filename = f"model-plefp8-{part:05d}.safetensors"
+        rows = (
+            torch.tensor(list(_rows(2)), dtype=torch.float32) + float(part)
+        ).to(torch.float8_e4m3fn).contiguous()
+        tensors = {key: rows}
+        if part == 0:
+            tensors[prefix + ".weight_scale"] = torch.tensor(0.5, dtype=torch.bfloat16)
+            weight_map[prefix + ".weight_scale"] = filename
+        save_file(tensors, z_fixture_dir / filename)
+        weight_map[key] = filename
+        source_rows.extend(rows.float().tolist())
+    (z_fixture_dir / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map}), encoding="utf-8"
+    )
+    manifest = write_q3_ple_from_safetensors(
+        z_fixture_dir,
+        z_fixture_dir / "ple-q3.bin",
+        z_fixture_dir / "ple-q3.json",
+        layer_id=2,
+        split_parts=2,
+        source_fingerprint="f" * 64,
+        rows_per_chunk=1,
+        segment_rows=3,
+    )
+    reference = _load_authoritative_reference()
+    assert (z_fixture_dir / "ple-q3.bin").read_bytes() == reference.encode_table(
+        source_rows, refinement_passes=2, scale_dtype="bf16"
+    )
+    assert manifest["rows"] == 4
+    assert manifest["file_bytes"] == 4 * ROW_BYTES
+    assert manifest["weight_scale"] == 0.5
