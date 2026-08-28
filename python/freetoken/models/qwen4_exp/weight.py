@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Iterator
 
 import safetensors
@@ -39,6 +40,44 @@ _FUSIONS = {
         ".mlp.shared_expert.up_proj.weight",
     ),
 }
+
+ACTIVE_NVFP4_FORMAT = "nvfp4_w4a16_v1"
+_ACTIVE_NVFP4_WEIGHT_SUFFIXES = (
+    ".self_attn.qkv_proj.weight",
+    ".self_attn.o_proj.weight",
+    ".linear_attn.in_proj_qkvz.weight",
+    ".linear_attn.out_proj.weight",
+    ".attn_hyper_connection.input_mix_weight_down.weight",
+    ".attn_hyper_connection.input_mix_weight_up.weight",
+    ".mlp_hyper_connection.input_mix_weight_down.weight",
+    ".mlp_hyper_connection.input_mix_weight_up.weight",
+    ".hyper_connection_mixer.input_mix_weight_down.weight",
+    ".hyper_connection_mixer.input_mix_weight_up.weight",
+    ".mlp.shared_expert.gate_up_proj.weight",
+    ".mlp.shared_expert.down_proj.weight",
+)
+
+
+def is_active_nvfp4_weight(name: str) -> bool:
+    """Whether a fused runtime-state weight belongs to the frozen Qwen4 map."""
+
+    return name.endswith(_ACTIVE_NVFP4_WEIGHT_SUFFIXES)
+
+
+def iter_active_nvfp4_runtime_entries(
+    entries: Iterable[tuple[str, torch.Tensor]],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Stream fused BF16 state into canonical native NVFP4 FTW entries."""
+
+    for name, tensor in entries:
+        if not is_active_nvfp4_weight(name):
+            yield name, tensor
+            continue
+        packed, scale, global_scale = encode_bf16_nvfp4(tensor)
+        prefix = name.removesuffix(".weight")
+        yield name, packed
+        yield prefix + ".weight_scale", scale
+        yield prefix + ".weight_global", global_scale
 
 
 def _rename(raw_name: str) -> str | None:
@@ -114,6 +153,9 @@ def iter_weights(
 __all__ = [
     "iter_weights",
     "encode_bf16_nvfp4",
+    "ACTIVE_NVFP4_FORMAT",
+    "is_active_nvfp4_weight",
+    "iter_active_nvfp4_runtime_entries",
     "iter_weights_parallel",
     "load_nvfp4_expert_sources",
     "load_nvfp4_expert_sources_parallel",

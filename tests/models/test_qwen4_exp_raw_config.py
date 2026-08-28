@@ -76,3 +76,27 @@ def test_qwen4_raw_config_uses_official_topk_normalization_default():
     assert config.norm_topk_prob is True
     assert config.rotary_config.max_position == 262_144
     assert config.attn_type_for_layer(3).value == "qsa"
+
+
+def test_qwen4_active_nvfp4_requires_explicit_artifact_marker():
+    published = _raw_checkpoint_config()
+    config = parse_config(published)
+    assert config.attn_quant == "none"
+    assert config.dense_quant == "none"
+
+    converted = _raw_checkpoint_config()
+    converted.freetoken_active_quant = "nvfp4_w4a16_v1"
+    config = parse_config(converted)
+    assert config.attn_quant == "nvfp4"
+    assert config.dense_quant == "nvfp4"
+
+
+def test_qwen4_rejects_unknown_active_weight_marker():
+    config = _raw_checkpoint_config()
+    config.freetoken_active_quant = "ambiguous-q8"
+    try:
+        parse_config(config)
+    except ValueError as exc:
+        assert "unsupported Qwen4 active-weight format" in str(exc)
+    else:
+        raise AssertionError("unknown active-weight marker was accepted")

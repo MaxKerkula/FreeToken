@@ -64,8 +64,8 @@ def test_file_expert_source_reads_exact_planes_and_rejects_tamper(z_fixture_dir)
 
 def test_file_expert_source_cache_miss_fills_slots_without_host_layer(z_fixture_dir):
     path = z_fixture_dir / "experts-L01.nvfp4"
-    digest = FileExpertSource.create_synthetic(path, num_experts=3, records=[_record(i + 11) for i in range(3)])
-    src = FileExpertSource(path, num_experts=3, expected_sha256=digest)
+    digest = FileExpertSource.create_synthetic(path, num_experts=3, records=[_record(i + 11) for i in range(3)], layer_id=1)
+    src = FileExpertSource(path, num_experts=3, expected_sha256=digest, expected_layer_id=1)
     try:
         from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -97,8 +97,8 @@ def test_file_expert_source_cache_miss_fills_slots_without_host_layer(z_fixture_
 
 def test_file_tier_materialize_streams_complete_layer(z_fixture_dir):
     path = z_fixture_dir / "experts-L01.nvfp4"
-    digest = FileExpertSource.create_synthetic(path, num_experts=3, records=[_record(i + 21) for i in range(3)])
-    src = FileExpertSource(path, num_experts=3, expected_sha256=digest)
+    digest = FileExpertSource.create_synthetic(path, num_experts=3, records=[_record(i + 21) for i in range(3)], layer_id=1)
+    src = FileExpertSource(path, num_experts=3, expected_sha256=digest, expected_layer_id=1)
     try:
         from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -110,6 +110,84 @@ def test_file_tier_materialize_streams_complete_layer(z_fixture_dir):
         values = cache.bank_caches["gate_up_packed"][:, 0, 0].tolist()
         assert values == [21, 22, 23]
         assert src.read_count == 3
+        assert cache.slot_for_id[1].tolist() == [0, 1, 2]
+        assert cache.id_of_slot.tolist() == [3, 4, 5]
+    finally:
+        src.close()
+
+
+def test_file_only_cache_derives_planes_without_any_hostbank(z_fixture_dir):
+    path = z_fixture_dir / "experts-L00.nvfp4"
+    digest = FileExpertSource.create_synthetic(path, num_experts=2, records=[_record(41), _record(42)])
+    src = FileExpertSource(path, num_experts=2, expected_sha256=digest)
+    try:
+        from freetoken.moe.offload_cache import OffloadMoeCache
+
+        cache = OffloadMoeCache(1, 2, 2, torch.device("cpu"), quant_format="nvfp4")
+        cache.set_file_sources({0: src})
+        assert all(all(item is None for item in layers) for layers in cache.bank_sources.values())
+        ids = torch.tensor([1], dtype=torch.int32)
+        cache.ensure_experts(0, ids)
+        cache.copy_missing()
+        assert cache.bank_caches["gate_up_packed"][0, 0, 0].item() == 42
+    finally:
+        src.close()
+
+
+def test_file_only_multilayer_identity_eviction_and_reset(z_fixture_dir):
+    path0 = z_fixture_dir / "experts-L00.nvfp4"
+    path1 = z_fixture_dir / "experts-L01.nvfp4"
+    digest0 = FileExpertSource.create_synthetic(path0, num_experts=2, records=[_record(51), _record(52)], layer_id=0)
+    digest1 = FileExpertSource.create_synthetic(path1, num_experts=2, records=[_record(61), _record(62)], layer_id=1)
+    src0 = FileExpertSource(path0, num_experts=2, expected_sha256=digest0, expected_layer_id=0)
+    src1 = FileExpertSource(path1, num_experts=2, expected_sha256=digest1, expected_layer_id=1)
+    try:
+        from freetoken.moe.offload_cache import OffloadMoeCache
+
+        cache = OffloadMoeCache(2, 2, 2, torch.device("cpu"), quant_format="nvfp4")
+        cache.set_file_sources({0: src0, 1: src1})
+        ids0 = torch.tensor([0, 1], dtype=torch.int32)
+        cache.ensure_experts(0, ids0)
+        cache.copy_missing()
+        ids1 = torch.tensor([0], dtype=torch.int32)
+        cache.ensure_experts(1, ids1)
+        cache.copy_missing()
+        slot = int(ids1.item())
+        assert cache.slot_for_id[1, 0].item() == slot
+        assert cache.slot_for_id[0, slot].item() == -1
+        assert cache.bank_caches["gate_up_packed"][slot, 0, 0].item() == 61
+        cache.reset()
+        assert (cache.slot_for_id == -1).all()
+        assert (cache.id_of_slot == -1).all()
+    finally:
+        src0.close()
+        src1.close()
+
+
+def test_file_tier_read_failure_rolls_back_slot_bookkeeping(z_fixture_dir, monkeypatch):
+    path = z_fixture_dir / "experts-L01.nvfp4"
+    digest = FileExpertSource.create_synthetic(path, num_experts=2, records=[_record(31), _record(32)], layer_id=1)
+    src = FileExpertSource(path, num_experts=2, expected_sha256=digest, expected_layer_id=1)
+    try:
+        from freetoken.moe.offload_cache import OffloadMoeCache
+
+        cache = OffloadMoeCache(2, 2, 2, torch.device("cpu"), quant_format="nvfp4")
+        cache.set_bank_sources(_resident_banks(2, 2))
+        cache.set_file_sources({1: src})
+        before_slots = cache.slot_for_id.clone()
+        before_ids = cache.id_of_slot.clone()
+        ids = torch.tensor([1], dtype=torch.int32)
+        cache.ensure_experts(1, ids)
+
+        def fail_read(*_args, **_kwargs):
+            raise ExpertSourceError("synthetic short read")
+
+        monkeypatch.setattr(src, "read_into", fail_read)
+        with pytest.raises(ExpertSourceError, match="short read"):
+            cache.copy_missing()
+        assert torch.equal(cache.slot_for_id, before_slots)
+        assert torch.equal(cache.id_of_slot, before_ids)
+        assert cache._pending_file_fetches == []
     finally:
         src.close()
 

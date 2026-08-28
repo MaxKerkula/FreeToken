@@ -143,6 +143,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
             f"detected {detected_quant!r}"
         )
 
+    active_quant = getattr(hf_config, "freetoken_active_quant", None)
+    if active_quant not in (None, "nvfp4_w4a16_v1"):
+        raise ValueError(f"unsupported Qwen4 active-weight format: {active_quant}")
+    active_linear_quant = "nvfp4" if active_quant == "nvfp4_w4a16_v1" else "none"
+
     return ModelConfig(
         num_layers=int(text.num_hidden_layers),
         num_qo_heads=int(text.num_attention_heads),
@@ -167,10 +172,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
         moe_enabled=True,
         expert_quant=expert_quant,
         weight_block_size=block_size,
-        # Only routed experts and PLE are FP8 in the official checkpoint. All
-        # attention, hyper-connection, and shared-expert projections stay BF16.
-        attn_quant="none",
-        dense_quant="none",
+        # The published experts-only checkpoint has no active-weight marker and
+        # therefore retains BF16 operators.  Only the canonical preconverted
+        # FTW artifact may opt into the frozen native W4A16 map.
+        attn_quant=active_linear_quant,
+        dense_quant=active_linear_quant,
         lm_head_quant="none",
         use_qk_norm=True,
         # Qwen3.8-Flash-Next is a VL checkpoint. Vision is part of this model,

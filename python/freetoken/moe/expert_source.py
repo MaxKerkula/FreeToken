@@ -44,7 +44,15 @@ for _name, _size, _dtype in PLANE_LAYOUT:
     _cursor += _size
 assert _cursor == RAW_RECORD_BYTES
 
-_HEADER_STRUCT = struct.Struct("<8sIIIIQQ16s32s32s")
+_HEADER_STRUCT = struct.Struct("<8sIIIIIQQ16s32s32s")
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class ExpertSourceError(RuntimeError):
@@ -70,6 +78,17 @@ def _dtype(name: str) -> torch.dtype:
     }[name]
 
 
+def _plane_shape(name: str) -> tuple[int, ...]:
+    return {
+        "gate_up_packed": (1280, 1280),
+        "gate_up_scale": (1280, 160),
+        "gate_up_global": (1280,),
+        "down_packed": (2560, 320),
+        "down_scale": (2560, 40),
+        "down_global": (2560,),
+    }[name]
+
+
 class FileExpertSource:
     """Read fixed NVFP4 expert records from one layer sidecar.
 
@@ -86,6 +105,10 @@ class FileExpertSource:
     raw_record_bytes = RAW_RECORD_BYTES
     num_experts = NUM_EXPERTS
     max_queue_depth = 16
+    plane_specs = {
+        name: (_plane_shape(name), _dtype(dtype_name))
+        for name, _size, dtype_name in PLANE_LAYOUT
+    }
 
     def __init__(
         self,
@@ -93,6 +116,7 @@ class FileExpertSource:
         *,
         expected_sha256: str | None = None,
         expected_source_fingerprint: str | bytes | None = None,
+        expected_layer_id: int | None = None,
         num_experts: int = NUM_EXPERTS,
         max_queue_depth: int = 1,
         verify_hash: bool = True,
@@ -112,7 +136,7 @@ class FileExpertSource:
         self._closed = False
         self._fd = os.open(str(self.path), os.O_RDONLY | getattr(os, "O_BINARY", 0))
         try:
-            self._validate_file(expected_source_fingerprint)
+            self._validate_file(expected_source_fingerprint, expected_layer_id)
             self.sha256 = self._hash_file() if verify_hash else None
             if expected_sha256 is not None:
                 expected_sha256 = expected_sha256.lower()
@@ -138,6 +162,7 @@ class FileExpertSource:
         num_experts: int = NUM_EXPERTS,
         records: Iterable[bytes] | None = None,
         source_fingerprint: bytes | None = None,
+        layer_id: int = 0,
     ) -> str:
         """Create a tiny deterministic sidecar for tests (never model data)."""
         path = _z_path(path)
@@ -158,6 +183,7 @@ class FileExpertSource:
                 HEADER_BYTES,
                 num_experts,
                 len(PLANE_LAYOUT),
+                int(layer_id),
                 RAW_RECORD_BYTES,
                 RECORD_BYTES,
                 b"nvfp4-qwen4-v1\0\0",  # 16-byte layout tag
@@ -176,25 +202,35 @@ class FileExpertSource:
         with path.open("r+b") as fh:
             fh.seek(0)
             header = bytearray(fh.read(HEADER_BYTES))
-            header[struct.calcsize("<8sIIIIQQ16s32s") : _HEADER_STRUCT.size] = digest
+            header[_HEADER_STRUCT.size - 32 : _HEADER_STRUCT.size] = digest
             fh.seek(0)
             fh.write(header)
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        # Keep synthetic native-geometry fixtures bounded: the real 512-record
+        # shape is roughly 1.42 GB and must never be read into one Python bytes
+        # object merely to produce its verification hash.
+        return _sha256_path(path)
 
-    def _validate_file(self, expected_source_fingerprint: str | bytes | None) -> None:
+    def _validate_file(
+        self, expected_source_fingerprint: str | bytes | None, expected_layer_id: int | None
+    ) -> None:
         size = self.path.stat().st_size
         expected_size = HEADER_BYTES + self.num_experts * self.record_bytes
         header = self._read_exact(HEADER_BYTES, 0)
         if len(header) != HEADER_BYTES:
             raise ExpertSourceError("truncated expert tier header")
         try:
-            magic, version, hbytes, experts, planes, raw_bytes, rec_bytes, tag, fingerprint, payload_hash = _HEADER_STRUCT.unpack_from(header)
+            magic, version, hbytes, experts, planes, layer_id, raw_bytes, rec_bytes, tag, fingerprint, payload_hash = _HEADER_STRUCT.unpack_from(header)
         except struct.error as exc:
             raise ExpertSourceError("malformed expert tier header") from exc
         if magic != MAGIC or version != VERSION or hbytes != HEADER_BYTES:
             raise ExpertSourceError("unsupported expert tier magic/version/header")
         if experts != self.num_experts or planes != len(PLANE_LAYOUT):
             raise ExpertSourceError("expert tier geometry mismatch")
+        self.layer_id = int(layer_id)
+        if expected_layer_id is not None and self.layer_id != int(expected_layer_id):
+            raise ExpertSourceError(
+                f"expert tier layer mismatch: {self.layer_id} != {int(expected_layer_id)}"
+            )
         if raw_bytes != RAW_RECORD_BYTES or rec_bytes != RECORD_BYTES or tag.rstrip(b"\0") != b"nvfp4-qwen4-v1":
             raise ExpertSourceError("expert tier layout mismatch")
         if size != expected_size:
@@ -231,14 +267,7 @@ class FileExpertSource:
         return data
 
     def _hash_file(self) -> str:
-        h = hashlib.sha256()
-        with self.path.open("rb") as fh:
-            while True:
-                block = fh.read(8 << 20)
-                if not block:
-                    break
-                h.update(block)
-        return h.hexdigest()
+        return _sha256_path(self.path)
 
     def _record_bytes(self, expert_id: int) -> bytes:
         if self._closed:
@@ -265,19 +294,11 @@ class FileExpertSource:
         for name, size, dtype_name in PLANE_LAYOUT:
             offset = _PLANE_OFFSETS[name]
             dtype = _dtype(dtype_name)
-            if name == "gate_up_packed":
-                shape = (1280, 1280)
-            elif name == "down_packed":
-                shape = (2560, 320)
-            elif name == "gate_up_scale":
-                shape = (1280, 160)
-            elif name == "gate_up_global":
-                shape = (1280,)
-            elif name == "down_scale":
-                shape = (2560, 40)
-            else:
-                shape = (2560,)
-            out[name] = torch.frombuffer(memoryview(raw)[offset : offset + size], dtype=dtype).clone().reshape(shape)
+            shape = _plane_shape(name)
+            # bytearray supplies a writable, record-local staging buffer and
+            # avoids exposing Python's immutable bytes through a writable tensor.
+            staging = bytearray(raw[offset : offset + size])
+            out[name] = torch.frombuffer(staging, dtype=dtype).reshape(shape)
         return out
 
     def read_records(self, expert_ids: Iterable[int], *, max_concurrency: int = 1) -> list[dict[str, torch.Tensor]]:
