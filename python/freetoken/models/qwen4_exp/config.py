@@ -9,6 +9,7 @@ from freetoken.models.config import (
     RotaryConfig,
     detect_expert_quant,
 )
+from freetoken.checkpoint.qwen4_artifact import qwen4_text_only_marker
 
 from .args import Qwen4ExpArgs, Qwen4VisionConfig
 
@@ -94,7 +95,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
             "Qwen4-Exp mrope_section must cover the rotary dimension: "
             f"{qwen4_args.mrope_section} vs {rotary_dim}"
         )
-    raw_vision = getattr(hf_config, "vision_config", None)
+    # A modular Qwen4 artifact is explicitly text-only.  Keep the ordinary source
+    # checkpoint behavior untouched (vision remains part of the parsed model) and
+    # fail closed on an unknown target marker in qwen4_text_only_marker().
+    text_only = qwen4_text_only_marker(hf_config)
+    raw_vision = None if text_only else getattr(hf_config, "vision_config", None)
     vision_config = None
     if raw_vision is not None:
         vision_config = Qwen4VisionConfig(
@@ -182,7 +187,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         # Qwen3.8-Flash-Next is a VL checkpoint. Vision is part of this model,
         # not an optional text-only add-on.
         vision_config=vision_config,
-        image_token_id=getattr(hf_config, "image_token_id", None),
+        image_token_id=None if text_only else getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         qwen4_args=qwen4_args,
         # PLE keeps per-request dilated-convolution state outside the generic

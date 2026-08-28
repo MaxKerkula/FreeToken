@@ -745,6 +745,36 @@ class Qwen4ExpModel(BaseOP):
         self._image_token_id = config.image_token_id
 
     def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
+        # Modular Qwen4 artifacts carry an explicit Q3_PLE sidecar.  Once the
+        # target marker is present, selecting that sidecar is mandatory: silently
+        # falling back to the 51-GiB FP8 safetensors table would defeat the artifact's
+        # bounded host-memory contract.  Unmarked source checkpoints keep the original
+        # FP8 path unchanged.
+        if not dummy:
+            from freetoken.checkpoint.qwen4_artifact import (
+                load_qwen4_artifact_manifest,
+                qwen4_text_only_marker,
+            )
+
+            artifact = load_qwen4_artifact_manifest(model_path)
+            if artifact is not None:
+                self.load_q3_ple_weights(str(artifact.ple_manifest_path))
+                return
+            # A known text-only target marker without its modular manifest is
+            # incomplete.  Do not silently reopen the source FP8 PLE table.
+            try:
+                from freetoken.utils import cached_load_hf_config
+
+                if qwen4_text_only_marker(cached_load_hf_config(model_path)):
+                    raise ValueError(
+                        "Qwen4 text-only target is marked but manifest.json is missing"
+                    )
+            except ValueError:
+                raise
+            except Exception:
+                # Unmarked hub/source paths retain the historical loader behavior;
+                # parse_config remains the authoritative marker validator.
+                pass
         for layer in self.layers.op_list:
             if layer.ple is not None:
                 layer.ple.load_host_weights(model_path, dummy=dummy)

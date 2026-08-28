@@ -217,6 +217,7 @@ def convert_checkpoint(
     moe_backend: str = "offload",
     shard_limit: int = DEFAULT_SHARD_LIMIT,
     device: str | None = None,
+    artifact_format: str | None = None,
 ) -> dict:
     """Write ``model_path`` as an FTW checkpoint at ``out_dir``. Returns the index dict.
 
@@ -246,6 +247,13 @@ def convert_checkpoint(
     cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(tp.rank, tp.size),
                        dtype=dtype, moe_backend=moe_backend)
     mc = cfg.model_config
+    if artifact_format not in (None, "qwen4_modular_v1"):
+        raise ValueError(
+            f"unsupported artifact_format {artifact_format!r}; expected None or 'qwen4_modular_v1'"
+        )
+    is_qwen4 = any("Qwen4" in str(arch) for arch in getattr(mc, "architectures", ()))
+    if artifact_format is not None and not is_qwen4:
+        raise ValueError("artifact_format='qwen4_modular_v1' requires a Qwen4 checkpoint")
     offload = moe_backend == "offload" and getattr(mc, "is_moe", False)
     include_moe_experts = not offload
 
@@ -257,8 +265,31 @@ def convert_checkpoint(
     # 1) dense weights (host tensors; load straight to CPU to avoid GPU pressure)
     _progress("dense", 0, 0)  # phase start; per-tensor cumulative bytes follow (total unknown)
     dense_bytes = 0
-    for name, tensor in count_bar(load_weight(model_path, torch.device("cpu"),
-                                              include_moe_experts=include_moe_experts),
+    dense_entries = load_weight(
+        model_path,
+        torch.device("cpu"),
+        include_moe_experts=include_moe_experts,
+    )
+    if artifact_format == "qwen4_modular_v1":
+        # Quantization is an explicit artifact-build policy, never a generic runtime
+        # fallback.  The Qwen4 iterator has already fused canonical projections; this
+        # wrapper only converts the frozen active map while leaving routers, PLE, and
+        # all non-active entries untouched.
+        from freetoken.models.qwen4_exp.weight import iter_active_nvfp4_runtime_entries
+
+        def _modular_dense_entries():
+            from freetoken.models.config import VISION_KEY_PREFIXES
+
+            for name, tensor in iter_active_nvfp4_runtime_entries(dense_entries):
+                # The modular target is text-only by contract.  Qwen4's canonical
+                # rename uses ``visual.*`` while other wrappers retain the generic
+                # vision prefixes; drop both explicitly at conversion time.
+                if name.startswith(("visual.",) + VISION_KEY_PREFIXES):
+                    continue
+                yield name, tensor
+
+        dense_entries = _modular_dense_entries()
+    for name, tensor in count_bar(dense_entries,
                                   "Converting dense weights"):
         writer.add_tensor(name, tensor, kind="weight")
         n_weight += 1
@@ -325,6 +356,19 @@ def convert_checkpoint(
 
     _progress("finalize")  # writing shard index + copying config/tokenizer
     copied = _copy_metadata(model_path, out_dir)
+    if artifact_format == "qwen4_modular_v1":
+        config_path = os.path.join(out_dir, "config.json")
+        if not os.path.isfile(config_path):
+            raise ValueError("Qwen4 modular conversion requires a copied config.json")
+        with open(config_path, "r", encoding="utf-8") as handle:
+            config_data = json.load(handle)
+        config_data["freetoken_text_only"] = "qwen4_text_only_v1"
+        config_data["freetoken_active_quant"] = "nvfp4_w4a16_v1"
+        tmp_config = config_path + ".tmp"
+        with open(tmp_config, "w", encoding="utf-8") as handle:
+            json.dump(config_data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_config, config_path)
 
     try:
         fingerprint = _source_fingerprint(model_path, mc, device=dev)

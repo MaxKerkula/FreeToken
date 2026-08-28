@@ -506,6 +506,65 @@ class Engine:
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
+        # Qwen4 modular artifacts carry their own mixed expert tier.  The ordinary
+        # loader cannot infer file-backed layers from a generic checkpoint path, so
+        # resolve the manifest first and route through the explicit wiring seam.
+        from freetoken.checkpoint.qwen4_artifact import (
+            build_mixed_expert_sources,
+            configure_mixed_expert_sources,
+            load_qwen4_artifact_manifest,
+        )
+
+        artifact = load_qwen4_artifact_manifest(config.model_path)
+        if artifact is not None:
+            if config.moe_backend != "offload":
+                raise ValueError(
+                    "Qwen4 modular expert tiers are GPU-only; use --moe-backend offload"
+                )
+            if config.moe_prefill_overlap:
+                object.__setattr__(config, "moe_prefill_overlap", False)
+            # Expert sidecars are authoritative for both tiers.  Resident layers are
+            # streamed one record at a time into HostBanks; file layers remain open
+            # FileExpertSource readers and never materialize a full layer.
+            resident_sources, file_sources = build_mixed_expert_sources(
+                artifact,
+                num_experts=config.model_config.num_experts,
+                resident_residency=["pinned"] * artifact.num_layers,
+                verify_hash=not config.use_dummy_weight,
+            )
+            from freetoken.moe.expert_banks import ExpertBanks
+
+            banks = ExpertBanks("nvfp4", resident_sources)
+            if config.moe_cache_auto:
+                size, pages, _overlap = self._resolve_auto_moe_cache_size(config, banks)
+                object.__setattr__(config, "moe_cache_size", max(size, 512))
+                if config.num_page_override is None:
+                    object.__setattr__(config, "num_page_override", pages)
+            _require_offload_cache_size(config.moe_cache_size, 512)
+            cache = OffloadMoeCache(
+                num_layers=config.model_config.num_moe_layers,
+                num_experts=config.model_config.num_experts,
+                cache_size=config.moe_cache_size,
+                device=self.device,
+                cache_policy=config.moe_cache_policy,
+                prefill_overlap=False,
+                prefill_hit_d2d=False,
+                quant_format=banks.quant_format,
+                decode_target="gpu",
+                hybrid_max_fetch=config.moe_hybrid_max_fetch,
+            )
+            cache.cpu_layer_ids = frozenset()
+            configure_mixed_expert_sources(
+                cache, artifact, banks.sources, file_sources=file_sources
+            )
+            cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+            cache.collect_stats = config.moe_collect_stats
+            layers = attach_offload_moe_cache(self.model, cache)
+            assert len(layers) == config.model_config.num_moe_layers
+            self.ctx.moe_offload_cache = cache
+            self.moe_offload_cache = cache
+            return cache
+
         # A model may fully own cache construction via make_offload_moe_cache.
         # Otherwise load_expert_banks gives the model module a setup hook first, then
         # falls back to per-quant providers, and the engine wires the banks into cache.
