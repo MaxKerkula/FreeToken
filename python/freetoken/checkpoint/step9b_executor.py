@@ -1820,18 +1820,32 @@ class Step9BExecutor:
         result: dict[str, Any] = {}
         if not active.exists():
             result = convert_checkpoint(str(self.source_root), str(self.target_root), artifact_format="qwen4_modular_v1", source_inventory_sha256=self.source_inventory_fingerprint)
-        from freetoken.checkpoint.ftw import INDEX_NAME
+        from freetoken.checkpoint.ftw import INDEX_NAME, ensure_ftw_terminal_padding
         index = active / INDEX_NAME
         if not active.is_dir() or not index.is_file():
             raise ExecutorError("active FTW was not created")
         with index.open("r", encoding="utf-8") as handle:
             index_data = json.load(handle)
-        if int(index_data.get("total_bytes", -1)) != ACTIVE_BYTES:
+        active_bytes = int(index_data.get("total_bytes", -1))
+        padding_result = None
+        if active_bytes in (ACTIVE_BYTES - 4096, ACTIVE_BYTES):
+            try:
+                padding_result = ensure_ftw_terminal_padding(
+                    str(active),
+                    expected_unpadded_bytes=ACTIVE_BYTES - 4096,
+                    target_bytes=ACTIVE_BYTES,
+                )
+            except (OSError, ValueError) as exc:
+                raise ExecutorError(f"active FTW terminal padding failed: {exc}") from exc
+            with index.open("r", encoding="utf-8") as handle:
+                index_data = json.load(handle)
+            active_bytes = int(index_data.get("total_bytes", -1))
+        if active_bytes != ACTIVE_BYTES:
             raise ExecutorError("active FTW extent mismatch")
         tree_bytes, tree_sha = _tree_sha256(active)
         expected = {"stage": "B4", "format": "nvfp4_w4a16_v1", "target": str(active), "target_bytes": ACTIVE_BYTES, "target_tree_bytes": tree_bytes, "target_sha256": tree_sha, "source_inventory_fingerprint": self.source_inventory_fingerprint, "source_revision": self.manifest.revision, "builder_commit": self.builder_commit, "runtime_commit": self.runtime_commit, "source_inputs": self._source_bindings(self.manifest.rows_for_stage("B4"))}
         if not _receipt_matches(receipt_path, expected):
-            _publish_component_receipt(receipt_path, {**expected, "copied_metadata": list(result.get("copied_metadata", ())), "validation": {"ftw_index": True}, "recovered_after_promotion": not bool(result)})
+            _publish_component_receipt(receipt_path, {**expected, "copied_metadata": list(result.get("copied_metadata", ())), "validation": {"ftw_index": True, "terminal_padding": padding_result}, "recovered_after_promotion": not bool(result)})
         return {**expected, "state": "COMPLETE", "recovered_after_promotion": not bool(result)}
 
     def finalize_artifact(self) -> dict[str, Any]:
