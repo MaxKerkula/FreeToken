@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -39,6 +40,8 @@ ACTIVE_BYTES = 4_804_403_200
 EXPERT_BYTES = 1_419_776_000
 MAX_DOWNLOADS = 2
 MAX_SAFETENSORS_HEADER_BYTES = 256 << 20
+PRODUCTION_PLE_SOURCE_LAYER_ID = 1
+PRODUCTION_PLE_SEGMENT_COUNT = 128
 ACCEPTED_SOURCE_INVENTORY = "8572d200e31b344faff0fda f0dc72aa4726c1f062443d4109531b62ca63f66eb".replace(" ", "")
 ACQUISITION_MANIFEST_V1 = "freetoken-step9-acquisition-v1"
 ACQUISITION_MANIFEST_V2 = "freetoken-step9-acquisition-v2"
@@ -60,6 +63,91 @@ class ResumeRejected(ExecutorError):
 
 class AtomicJsonReplaceError(ExecutorError):
     """A bounded Windows atomic-publication retry exhausted its deadline."""
+
+
+_PLE_SHARD_KEY = re.compile(
+    r"^model\.language_model\.layers\.(?P<layer>\d+)\.ple\.ple_embedding\."
+    r"ngram_embedding\.shard_(?P<index>\d+)\.weight$"
+)
+_PLE_SHARD_PREFIX = re.compile(
+    r"^model\.language_model\.layers\.(?P<layer>\d+)\.ple\.ple_embedding\."
+    r"ngram_embedding\.shard_"
+)
+_PLE_SCALE_KEY = re.compile(
+    r"^model\.language_model\.layers\.(?P<layer>\d+)\.ple\.ple_embedding\."
+    r"ngram_embedding\.weight_scale$"
+)
+
+
+def _resolve_production_ple_source_layer(index_path: Path) -> int:
+    """Validate and return the frozen production PLE source layer.
+
+    The target model exposes one PLE table under source layer 1.  Its 128
+    logical tensors are distinct from the ten physical Safetensors files.  Do
+    not infer a different layer from whichever matching key happens to appear:
+    require the exact frozen namespace and reject competing PLE shard sets.
+    """
+    try:
+        with index_path.open("r", encoding="utf-8") as handle:
+            document = json.load(handle)
+        weight_map = document["weight_map"]
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise ExecutorError(f"cannot read PLE source index: {index_path}") from exc
+    if not isinstance(weight_map, Mapping):
+        raise ExecutorError("source index weight_map must be an object")
+
+    by_layer: dict[int, set[int]] = {}
+    scale_layers: set[int] = set()
+    for key, source_file in weight_map.items():
+        if not isinstance(key, str):
+            continue
+        match = _PLE_SHARD_KEY.fullmatch(key)
+        if match is None:
+            malformed = _PLE_SHARD_PREFIX.match(key)
+            if malformed is not None:
+                raise ExecutorError(f"malformed PLE source tensor key: {key}")
+            scale = _PLE_SCALE_KEY.fullmatch(key)
+            if scale is not None:
+                scale_layers.add(int(scale.group("layer")))
+            continue
+        if not isinstance(source_file, str) or not source_file:
+            raise ExecutorError(f"invalid PLE source file mapping for {key}")
+        layer = int(match.group("layer"))
+        index = int(match.group("index"))
+        if index in by_layer.setdefault(layer, set()):
+            raise ExecutorError(f"duplicate PLE source tensor index {index} for layer {layer}")
+        by_layer[layer].add(index)
+
+    expected_indices = set(range(PRODUCTION_PLE_SEGMENT_COUNT))
+    if set(by_layer) != {PRODUCTION_PLE_SOURCE_LAYER_ID}:
+        raise ExecutorError(
+            "production PLE source layer mismatch: "
+            f"expected only layer {PRODUCTION_PLE_SOURCE_LAYER_ID}, found {sorted(by_layer)}"
+        )
+    observed = by_layer[PRODUCTION_PLE_SOURCE_LAYER_ID]
+    if observed != expected_indices:
+        missing = sorted(expected_indices - observed)
+        unexpected = sorted(observed - expected_indices)
+        raise ExecutorError(
+            "production PLE logical segment mismatch: "
+            f"missing={missing}; unexpected={unexpected}"
+        )
+
+    prefix = (
+        f"model.language_model.layers.{PRODUCTION_PLE_SOURCE_LAYER_ID}."
+        "ple.ple_embedding.ngram_embedding"
+    )
+    scale_key = prefix + ".weight_scale"
+    if not scale_layers:
+        raise ExecutorError(f"production PLE global scale is missing: {scale_key}")
+    if scale_layers != {PRODUCTION_PLE_SOURCE_LAYER_ID}:
+        raise ExecutorError(
+            "production PLE scale layer mismatch: "
+            f"expected only layer {PRODUCTION_PLE_SOURCE_LAYER_ID}, found {sorted(scale_layers)}"
+        )
+    if not isinstance(weight_map[scale_key], str) or not weight_map[scale_key]:
+        raise ExecutorError(f"invalid PLE source file mapping for {scale_key}")
+    return PRODUCTION_PLE_SOURCE_LAYER_ID
 
 
 def _sha256(path: Path, chunk: int = 8 << 20) -> str:
@@ -1648,7 +1736,12 @@ class Step9BExecutor:
         if plan["segment_count"] != 128 or plan["total_bytes"] != Q3_BYTES:
             raise ExecutorError("Q3 production plan mismatch")
         if not self.execute:
-            return {"format": "q3_ple_32", **plan, "state": "PLANNED"}
+            return {
+                "format": "q3_ple_32",
+                **plan,
+                "source_layer_id": PRODUCTION_PLE_SOURCE_LAYER_ID,
+                "state": "PLANNED",
+            }
         self._disk_gate()
         self._host_gate()
         self.target_root.mkdir(parents=True, exist_ok=True)
@@ -1660,7 +1753,19 @@ class Step9BExecutor:
         if data_path.exists() != manifest_path.exists():
             raise ExecutorError("incomplete Q3 final target pair")
         if not data_path.exists():
-            result = write_q3_ple_from_safetensors(self.source_root, data_path, manifest_path, layer_id=2, split_parts=128, source_fingerprint=self.source_inventory_fingerprint, rows_per_segment=2_500_012, processing_chunk_rows=8192)
+            ple_source_layer_id = _resolve_production_ple_source_layer(
+                self.source_root / "model.safetensors.index.json"
+            )
+            result = write_q3_ple_from_safetensors(
+                self.source_root,
+                data_path,
+                manifest_path,
+                layer_id=ple_source_layer_id,
+                split_parts=PRODUCTION_PLE_SEGMENT_COUNT,
+                source_fingerprint=self.source_inventory_fingerprint,
+                rows_per_segment=2_500_012,
+                processing_chunk_rows=8192,
+            )
         if data_path.stat().st_size != Q3_BYTES:
             raise ExecutorError("Q3 target extent mismatch")
         with Q3PLEReader(manifest_path) as reader:
