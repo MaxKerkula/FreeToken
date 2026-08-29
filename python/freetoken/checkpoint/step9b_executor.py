@@ -40,6 +40,10 @@ EXPERT_BYTES = 1_419_776_000
 MAX_DOWNLOADS = 2
 MAX_SAFETENSORS_HEADER_BYTES = 256 << 20
 ACCEPTED_SOURCE_INVENTORY = "8572d200e31b344faff0fda f0dc72aa4726c1f062443d4109531b62ca63f66eb".replace(" ", "")
+ACQUISITION_MANIFEST_V1 = "freetoken-step9-acquisition-v1"
+ACQUISITION_MANIFEST_V2 = "freetoken-step9-acquisition-v2"
+SOURCE_IDENTITY_VERSION = 2
+SOURCE_RECEIPT_VERSION = 2
 
 
 class ExecutorError(RuntimeError):
@@ -121,6 +125,31 @@ def _receipt_matches(path: Path, expected: Mapping[str, Any]) -> bool:
     return value.get("completion") == "COMPONENT_COMPLETE" and all(value.get(key) == item for key, item in expected.items())
 
 
+def _clean_identity(value: Any) -> str | None:
+    """Return a normalized hex identity, retaining non-hex v1 fixtures."""
+    if value is None:
+        return None
+    text = str(value).strip().strip('"')
+    return text.lower() or None
+
+
+def _identity_values(*values: Any) -> tuple[str, ...]:
+    """Deduplicate identity values while preserving their declared order."""
+    result: list[str] = []
+    for value in values:
+        text = _clean_identity(value)
+        if text and text not in result:
+            result.append(text)
+    return tuple(result)
+
+
+def _validate_hex_identity(name: str, value: str | None, length: int) -> None:
+    if value is None:
+        return
+    if len(value) != length or any(char not in "0123456789abcdef" for char in value.lower()):
+        raise ExecutorError(f"{name} must be a {length}-character hexadecimal digest")
+
+
 @dataclass(frozen=True)
 class SourceEntry:
     """Normalized source row from ``source_weight_shards`` or metadata."""
@@ -138,9 +167,60 @@ class SourceEntry:
     layer_id: int | None = None
     tensor_payload_bytes: int | None = None
     git_blob_id: str | None = None
+    xet_file_hash: str | None = None
+    allowed_body_etags: tuple[str, ...] = ()
+    identity_version: int = 1
+
+    def __post_init__(self) -> None:
+        # v1 fixtures intentionally use short synthetic ETags.  Strict length
+        # and source-kind checks are applied only to normalized v2 rows.
+        if int(self.identity_version) >= SOURCE_IDENTITY_VERSION:
+            _validate_hex_identity("git_blob_id", self.git_blob_id, 40)
+            _validate_hex_identity("lfs_oid_sha256", self.lfs_oid_sha256, 64)
+            _validate_hex_identity("xet_file_hash", self.xet_file_hash, 64)
+            if not self.git_blob_id:
+                raise ExecutorError(f"{self.filename}: v2 row requires git_blob_id provenance")
+            if self.source_class.upper() != "METADATA" and (not self.lfs_oid_sha256 or not self.xet_file_hash):
+                raise ExecutorError(f"{self.filename}: v2 weight row requires LFS OID and Xet hash")
+            if self.lfs_oid_sha256 is not None and self.xet_file_hash is None:
+                raise ExecutorError(f"{self.filename}: v2 LFS row requires xet_file_hash")
+            if self.lfs_oid_sha256 is None and self.xet_file_hash is not None:
+                raise ExecutorError(f"{self.filename}: Xet hash requires an LFS OID")
+            if not self.allowed_body_etags:
+                raise ExecutorError(f"{self.filename}: v2 row requires allowed_body_etags")
+            for etag in self.allowed_body_etags:
+                if not str(etag).strip():
+                    raise ExecutorError(f"{self.filename}: body ETag cannot be empty")
+            expected_body = (
+                {self.git_blob_id.lower()}
+                if self.lfs_oid_sha256 is None and self.git_blob_id
+                else {self.lfs_oid_sha256.lower(), self.xet_file_hash.lower()}
+            )
+            if {str(etag).strip('"').lower() for etag in self.allowed_body_etags} != expected_body:
+                raise ExecutorError(f"{self.filename}: allowed_body_etags must match its Git or LFS/Xet identities")
+
+    @property
+    def body_etags(self) -> tuple[str, ...]:
+        """Canonical body ETag allow-list (v1 alias retained for callers)."""
+        return tuple(self.allowed_body_etags)
+
+    @property
+    def metadata_etag(self) -> str | None:
+        """The immutable metadata ETag, never the transport-body ETag."""
+        return self.lfs_oid_sha256 or self.git_blob_id
+
+    @property
+    def semantic_kind(self) -> str:
+        if self.lfs_oid_sha256 and self.xet_file_hash:
+            return "LFS_XET"
+        if self.lfs_oid_sha256:
+            return "LFS"
+        if self.git_blob_id:
+            return "GIT"
+        return "LEGACY"
 
     @classmethod
-    def from_mapping(cls, raw: Mapping[str, Any], *, order: int | None = None, metadata: bool = False) -> "SourceEntry":
+    def from_mapping(cls, raw: Mapping[str, Any], *, order: int | None = None, metadata: bool = False, schema_version: int = 1, legacy_migration: bool = False) -> "SourceEntry":
         filename = str(raw["filename"])
         if not filename or Path(filename).name != filename or filename in {".", ".."}:
             raise ExecutorError(f"unsafe manifest filename: {filename!r}")
@@ -148,6 +228,27 @@ class SourceEntry:
         revision = str(raw.get("revision", PINNED_REVISION))
         if repository != PINNED_REPOSITORY or revision != PINNED_REVISION:
             raise ExecutorError(f"source identity mismatch for {filename}")
+        raw_git = _clean_identity(raw.get("git_blob_id"))
+        raw_lfs = _clean_identity(raw.get("lfs_oid_sha256"))
+        raw_xet = _clean_identity(raw.get("xet_file_hash"))
+        legacy_etag = raw.get("accepted_etag")
+        # v1 used accepted_etag for Xet (and occasionally for Git).  It is
+        # migrated into an explicit xet_file_hash/body allow-list but never
+        # consulted by v2 execution paths.
+        if raw_xet is None and raw_lfs and legacy_etag and "xet_file_hash" not in raw and (int(schema_version) < SOURCE_IDENTITY_VERSION or legacy_migration):
+            # Migration of a v1 row: accepted_etag was the Xet hash.  Once a
+            # v2 row carries an explicit xet_file_hash (including null), the
+            # legacy field is intentionally ignored.
+            raw_xet = _clean_identity(legacy_etag)
+        body_values = raw.get("allowed_body_etags", raw.get("body_etags", raw.get("accepted_body_etags")))
+        if body_values is None:
+            if int(schema_version) >= SOURCE_IDENTITY_VERSION:
+                body_values = _identity_values(raw_lfs, raw_xet) if raw_lfs else _identity_values(raw_git)
+            else:
+                body_values = _identity_values(legacy_etag, raw_lfs, raw_git)
+        elif isinstance(body_values, str):
+            body_values = (body_values,)
+        body_etags = _identity_values(*tuple(body_values))
         return cls(
             filename=filename,
             byte_length=int(raw["byte_length"]),
@@ -156,12 +257,15 @@ class SourceEntry:
             repository=repository,
             revision=revision,
             accepted_etag=(raw.get("accepted_etag") or (raw.get("git_blob_id") if metadata else None)),
-            lfs_oid_sha256=raw.get("lfs_oid_sha256"),
+            lfs_oid_sha256=raw_lfs,
             accepted_header_length=raw.get("accepted_header_length"),
             accepted_header_sha256=raw.get("accepted_header_sha256"),
             layer_id=(None if raw.get("layer_id") is None else int(raw["layer_id"])),
             tensor_payload_bytes=(None if raw.get("tensor_payload_bytes") is None else int(raw["tensor_payload_bytes"])),
-            git_blob_id=(None if raw.get("git_blob_id") is None else str(raw["git_blob_id"])),
+            git_blob_id=raw_git,
+            xet_file_hash=raw_xet,
+            allowed_body_etags=body_etags,
+            identity_version=int(schema_version),
         )
 
 
@@ -174,18 +278,25 @@ class AcquisitionManifest:
     source_inventory_fingerprint: str
     expected_weight_bytes: int
     transfer_cap: int = MAX_TRANSFER_BYTES
+    schema_version: int = 1
 
     @classmethod
-    def load(cls, path: str | os.PathLike[str]) -> "AcquisitionManifest":
+    def load(cls, path: str | os.PathLike[str], *, require_v2: bool = False) -> "AcquisitionManifest":
         with Path(path).open("r", encoding="utf-8") as handle:
             raw = json.load(handle)
-        if raw.get("schema") != "freetoken-step9-acquisition-v1":
+        schema = str(raw.get("schema") or "")
+        if schema not in {ACQUISITION_MANIFEST_V1, ACQUISITION_MANIFEST_V2}:
             raise ExecutorError("unsupported acquisition manifest schema")
+        schema_version = 2 if schema == ACQUISITION_MANIFEST_V2 else 1
+        if schema_version >= SOURCE_IDENTITY_VERSION and raw.get("identity_schema") != "source_identity_v2":
+            raise ExecutorError("acquisition manifest v2 requires identity_schema=source_identity_v2")
+        if require_v2 and schema_version < SOURCE_IDENTITY_VERSION:
+            raise ExecutorError("canonical Step 9B execution requires acquisition manifest v2")
         repo, revision = str(raw.get("repository")), str(raw.get("revision"))
         if repo != PINNED_REPOSITORY or revision != PINNED_REVISION:
             raise ExecutorError("manifest source pin does not match the frozen revision")
-        rows = tuple(SourceEntry.from_mapping(row) for row in raw.get("source_weight_shards", ()))
-        metadata = tuple(SourceEntry.from_mapping(row, order=i + 1, metadata=True) for i, row in enumerate(raw.get("required_small_metadata", ())))
+        rows = tuple(SourceEntry.from_mapping(row, schema_version=schema_version) for row in raw.get("source_weight_shards", ()))
+        metadata = tuple(SourceEntry.from_mapping(row, order=i + 1, metadata=True, schema_version=schema_version) for i, row in enumerate(raw.get("required_small_metadata", ())))
         if len(rows) != 206 or len(metadata) != 9:
             raise ExecutorError(f"manifest requires 206 weights and 9 metadata files, got {len(rows)} / {len(metadata)}")
         orders = [row.acquisition_order for row in rows]
@@ -212,7 +323,7 @@ class AcquisitionManifest:
         inventory = str(raw.get("source_inventory_sha256") or ACCEPTED_SOURCE_INVENTORY).lower()
         if inventory != ACCEPTED_SOURCE_INVENTORY:
             raise ExecutorError("source tensor inventory fingerprint mismatch")
-        return cls(repo, revision, rows, metadata, inventory, expected, MAX_TRANSFER_BYTES)
+        return cls(repo, revision, rows, metadata, inventory, expected, MAX_TRANSFER_BYTES, schema_version)
 
     @property
     def all_entries(self) -> tuple[SourceEntry, ...]:
@@ -227,6 +338,155 @@ class AcquisitionManifest:
         if key == "B4":
             return tuple(row for row in self.entries if row.source_class.upper() == "BF16")
         return self.entries
+
+
+def normalize_source_entry_mapping(raw: Mapping[str, Any], *, metadata: bool = False, order: int | None = None, schema_version: int = SOURCE_IDENTITY_VERSION, identity_overrides: Mapping[str, Mapping[str, Any]] | None = None, legacy_migration: bool = False) -> dict[str, Any]:
+    """Normalize one v1/v2 manifest row into explicit source identities.
+
+    ``accepted_etag`` is retained solely as a legacy audit field.  v2 callers
+    must use ``git_blob_id``, ``lfs_oid_sha256``, ``xet_file_hash`` and the
+    explicit ``allowed_body_etags`` list.
+    """
+    normalized_raw = dict(raw)
+    override = dict((identity_overrides or {}).get(str(raw.get("filename")), {}))
+    for key in ("git_blob_id", "lfs_oid_sha256", "xet_file_hash", "allowed_body_etags"):
+        if key in override:
+            normalized_raw[key] = override[key]
+    entry = SourceEntry.from_mapping(normalized_raw, metadata=metadata, order=order, schema_version=schema_version, legacy_migration=legacy_migration)
+    value = dict(normalized_raw)
+    value["filename"] = entry.filename
+    value["byte_length"] = entry.byte_length
+    value["source_class"] = entry.source_class
+    value["acquisition_order"] = entry.acquisition_order
+    value["repository"] = entry.repository
+    value["revision"] = entry.revision
+    value["git_blob_id"] = entry.git_blob_id
+    value["lfs_oid_sha256"] = entry.lfs_oid_sha256
+    value["xet_file_hash"] = entry.xet_file_hash
+    value["allowed_body_etags"] = list(entry.allowed_body_etags)
+    # Preserve accepted_etag for v1 audit/replay only; no v2 execution path
+    # reads it as an identity.
+    return value
+
+
+def generate_acquisition_manifest_v2(raw: Mapping[str, Any], *, identity_overrides: Mapping[str, Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    """Generate a v2 manifest from a v1-shaped mapping without payload I/O."""
+    if str(raw.get("schema") or "") not in {ACQUISITION_MANIFEST_V1, ACQUISITION_MANIFEST_V2}:
+        raise ExecutorError("unsupported acquisition manifest schema")
+    result = dict(raw)
+    legacy_migration = str(raw.get("schema") or "") == ACQUISITION_MANIFEST_V1
+    result["schema"] = ACQUISITION_MANIFEST_V2
+    result["identity_schema"] = "source_identity_v2"
+    result["required_small_metadata"] = [
+        normalize_source_entry_mapping(row, metadata=True, order=index + 1, schema_version=SOURCE_IDENTITY_VERSION, identity_overrides=identity_overrides, legacy_migration=legacy_migration)
+        for index, row in enumerate(raw.get("required_small_metadata", ()))
+    ]
+    result["source_weight_shards"] = [
+        normalize_source_entry_mapping(row, schema_version=SOURCE_IDENTITY_VERSION, identity_overrides=identity_overrides, legacy_migration=legacy_migration)
+        for row in raw.get("source_weight_shards", ())
+    ]
+    return result
+
+
+def migrate_acquisition_manifest_v1_to_v2(path: str | os.PathLike[str], output_path: str | os.PathLike[str] | None = None, *, identity_overrides: Mapping[str, Mapping[str, Any]] | None = None) -> Path:
+    """Write a durable v2 manifest beside the v1 source (metadata-only)."""
+    source = Path(path)
+    destination = Path(output_path) if output_path is not None else source.with_name(f"{source.stem}.v2{source.suffix}")
+    with source.open("r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+    converted = generate_acquisition_manifest_v2(raw, identity_overrides=identity_overrides)
+    _atomic_json(destination, converted)
+    return destination
+
+
+def _bytes_sha256(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def migrate_source_receipt_v1_to_v2(
+    receipt_path: str | os.PathLike[str],
+    *,
+    row: SourceEntry,
+    source_inventory_fingerprint: str,
+    predecessor_path: str | os.PathLike[str] | None = None,
+    observed_metadata_etag: str | None = None,
+    observed_xet_file_hash: str | None = None,
+    observed_body_etag: str | None = None,
+    body_bytes: int = 0,
+) -> dict[str, Any]:
+    """Migrate one completed v1 source receipt without transferring bytes.
+
+    The original JSON bytes are copied to an immutable ``.v1`` sibling and
+    hashed into the v2 receipt.  Callers must validate the final source and
+    immutable metadata before invoking this helper.
+    """
+    path = Path(receipt_path)
+    predecessor = Path(predecessor_path) if predecessor_path is not None else path.with_suffix(path.suffix + ".v1")
+    if not path.is_file():
+        raise ExecutorError(f"source receipt missing: {path}")
+    original = path.read_bytes()
+    predecessor_sha = _bytes_sha256(original)
+    try:
+        prior = json.loads(original.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ExecutorError("invalid v1 source receipt") from exc
+    if prior.get("completion") != "SOURCE_COMPLETE":
+        raise ExecutorError("only completed v1 source receipts can be migrated")
+    if prior.get("receipt_version") == SOURCE_RECEIPT_VERSION:
+        predecessor_hash = _bytes_sha256(predecessor.read_bytes()) if predecessor.exists() else None
+        if prior.get("predecessor_receipt_sha256") and predecessor_hash != prior["predecessor_receipt_sha256"]:
+            raise ExecutorError("v2 receipt predecessor hash changed")
+        return prior
+    if predecessor.exists():
+        if predecessor.read_bytes() != original:
+            raise ExecutorError("existing predecessor receipt differs from current v1 bytes")
+    else:
+        predecessor.parent.mkdir(parents=True, exist_ok=True)
+        temporary = predecessor.with_name(f".{predecessor.name}.partial-{os.getpid()}-{threading.get_ident()}")
+        temporary.write_bytes(original)
+        try:
+            with temporary.open("rb") as handle:
+                os.fsync(handle.fileno())
+        except OSError:
+            pass
+        os.replace(temporary, predecessor)
+    metadata_etag = observed_metadata_etag or prior.get("observed_metadata_etag") or prior.get("observed_etag") or row.metadata_etag
+    xet = observed_xet_file_hash or prior.get("observed_xet_file_hash")
+    if row.xet_file_hash:
+        if not xet:
+            raise ExecutorError("LFS/Xet v1 receipt migration requires explicitly validated Xet metadata")
+        if _clean_identity(xet) != _clean_identity(row.xet_file_hash):
+            raise ExecutorError("v1 receipt Xet identity does not match manifest")
+    body_value = observed_body_etag or prior.get("observed_body_etag") or prior.get("observed_etag") or (row.allowed_body_etags[0] if row.allowed_body_etags else None)
+    body = str(body_value) if body_value is not None else None
+    receipt_entry = asdict(row)
+    receipt_entry["allowed_body_etags"] = list(row.allowed_body_etags)
+    migrated = {
+        **prior,
+        "receipt_version": SOURCE_RECEIPT_VERSION,
+        "identity_version": SOURCE_IDENTITY_VERSION,
+        "entry": receipt_entry,
+        "source_inventory_fingerprint": source_inventory_fingerprint,
+        "resolved_commit": row.revision,
+        "expected_git_blob_id": row.git_blob_id,
+        "expected_lfs_oid_sha256": row.lfs_oid_sha256,
+        "expected_xet_file_hash": row.xet_file_hash,
+        "allowed_body_etags": list(row.allowed_body_etags),
+        "observed_metadata_etag": metadata_etag,
+        "observed_xet_file_hash": xet,
+        "observed_body_etag": body,
+        "body_bytes": int(body_bytes),
+        "original_body_bytes": int(prior.get("body_bytes", 0) or 0),
+        "original_completion": prior.get("completion"),
+        "new_body_bytes": 0,
+        "lifetime_transfer_accounting": "unchanged",
+        "migration_reason": "storage_identity_v2",
+        "predecessor_receipt_sha256": predecessor_sha,
+        "predecessor_receipt_path": str(predecessor),
+        "completion": "SOURCE_COMPLETE",
+    }
+    _atomic_json(path, migrated)
+    return migrated
 
 
 @dataclass
@@ -402,14 +662,49 @@ class Downloader:
     def cancel(self) -> None:
         self._cancel.set()
 
-    def _identity(self, row: SourceEntry, length: int, remote: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def _identity(self, row: SourceEntry, length: int, remote: Mapping[str, Any] | None = None, *, observed_body_etag: str | None = None) -> dict[str, Any]:
         remote = dict(remote or {})
-        return {"repository": row.repository, "revision": row.revision, "resolved_commit": remote.get("commit") or remote.get("resolved_commit") or row.revision, "filename": row.filename, "expected_length": row.byte_length, "expected_etag": row.accepted_etag, "expected_lfs_oid": row.lfs_oid_sha256, "expected_header_length": row.accepted_header_length, "expected_header_sha256": row.accepted_header_sha256, "observed_etag": remote.get("etag"), "observed_xet_file_hash": remote.get("xet_file_hash"), "partial_length": length, "source_inventory_fingerprint": self.manifest.source_inventory_fingerprint, "acquisition_order": row.acquisition_order}
+        metadata_etag = remote.get("metadata_etag") or remote.get("etag")
+        body_etag = observed_body_etag if observed_body_etag is not None else remote.get("observed_body_etag")
+        value = {
+            "identity_version": SOURCE_IDENTITY_VERSION if self.manifest.schema_version >= SOURCE_IDENTITY_VERSION else 1,
+            "repository": row.repository,
+            "revision": row.revision,
+            "resolved_commit": remote.get("commit") or remote.get("resolved_commit") or row.revision,
+            "filename": row.filename,
+            "expected_length": row.byte_length,
+            "expected_git_blob_id": row.git_blob_id,
+            "expected_lfs_oid_sha256": row.lfs_oid_sha256,
+            "expected_xet_file_hash": row.xet_file_hash,
+            "allowed_body_etags": list(row.allowed_body_etags),
+            # Legacy aliases remain readable during v1->v2 migration.
+            "expected_etag": row.accepted_etag,
+            "expected_lfs_oid": row.lfs_oid_sha256,
+            "expected_header_length": row.accepted_header_length,
+            "expected_header_sha256": row.accepted_header_sha256,
+            "observed_metadata_etag": metadata_etag,
+            "observed_etag": metadata_etag,
+            "observed_xet_file_hash": remote.get("xet_file_hash"),
+            "observed_body_etag": body_etag,
+            "partial_length": length,
+            "source_inventory_fingerprint": self.manifest.source_inventory_fingerprint,
+            "acquisition_order": row.acquisition_order,
+        }
+        return value
 
     def validate_metadata(self, row: SourceEntry, response: TransportResponse) -> dict[str, Any]:
         headers = {k.lower(): v for k, v in response.headers.items()}
         observed_length = int(headers.get("content-length", "-1"))
         observed_etag = headers.get("etag")
+        observed_xet = headers.get("x-xet-hash") or headers.get("xet-file-hash") or headers.get("xet_file_hash")
+        observed_commit = headers.get("x-repo-commit") or headers.get("x-linked-commit")
+        if row.identity_version >= SOURCE_IDENTITY_VERSION:
+            if not observed_commit:
+                raise ExecutorError(f"{row.filename}: metadata response omitted immutable commit identity")
+            if observed_commit.strip() != row.revision:
+                raise ExecutorError(f"{row.filename}: metadata commit identity mismatch")
+        elif observed_commit and observed_commit.strip() != row.revision:
+            raise ExecutorError(f"{row.filename}: metadata commit identity mismatch")
         if observed_length != row.byte_length:
             raise ExecutorError(f"{row.filename}: content length mismatch")
         # Hugging Face uses two identities for Xet/LFS files.  The manifest's
@@ -417,6 +712,19 @@ class Downloader:
         # surfaced as HfFileMetadata.etag and may be returned as HTTP ETag by
         # the CDN.  A transport may expose either, so accept only either exact
         # frozen identity and never a merely non-empty header.
+        if row.identity_version >= SOURCE_IDENTITY_VERSION:
+            expected_metadata_etag = row.metadata_etag
+            if expected_metadata_etag and not observed_etag:
+                raise ExecutorError(f"{row.filename}: metadata response omitted required metadata ETag")
+            if expected_metadata_etag and observed_etag and observed_etag.strip('"').lower() != expected_metadata_etag.strip('"').lower():
+                raise ExecutorError(f"{row.filename}: metadata ETag identity mismatch")
+            if row.xet_file_hash and observed_xet and observed_xet.strip('"').lower() != row.xet_file_hash.lower():
+                raise ExecutorError(f"{row.filename}: metadata Xet identity mismatch")
+            if row.xet_file_hash and not observed_xet:
+                raise ExecutorError(f"{row.filename}: metadata response omitted required Xet identity")
+            if not row.xet_file_hash and observed_xet:
+                raise ExecutorError(f"{row.filename}: Git-backed metadata unexpectedly exposed Xet identity")
+            return {"resolved_commit": row.revision, "length": observed_length, "etag": observed_etag, "metadata_etag": observed_etag, "xet_file_hash": observed_xet, "body_bytes": 0}
         accepted = {str(value).strip('"') for value in (row.accepted_etag, row.lfs_oid_sha256) if value}
         if accepted and not observed_etag:
             raise ExecutorError(f"{row.filename}: metadata response omitted required ETag")
@@ -454,7 +762,15 @@ class Downloader:
             raise ExecutorError(f"{row.filename}: metadata length mismatch")
         xet = getattr(meta, "xet_file_data", None)
         xet_hash = str(getattr(xet, "file_hash", "") or "").strip('"')
-        if row.lfs_oid_sha256:
+        if row.identity_version >= SOURCE_IDENTITY_VERSION:
+            expected_metadata_etag = (row.lfs_oid_sha256 or row.git_blob_id or "").lower()
+            if expected_metadata_etag and etag != expected_metadata_etag:
+                raise ExecutorError(f"{row.filename}: metadata {'LFS OID' if row.lfs_oid_sha256 else 'Git blob'} identity mismatch")
+            if row.xet_file_hash and xet_hash != row.xet_file_hash.lower():
+                raise ExecutorError(f"{row.filename}: metadata Xet hash mismatch")
+            if not row.lfs_oid_sha256 and xet_hash:
+                raise ExecutorError(f"{row.filename}: Git metadata unexpectedly carries Xet identity")
+        elif row.lfs_oid_sha256:
             if etag != row.lfs_oid_sha256.lower():
                 raise ExecutorError(f"{row.filename}: metadata LFS OID mismatch")
             if row.accepted_etag and xet_hash != row.accepted_etag.strip('"').lower():
@@ -463,7 +779,7 @@ class Downloader:
             # Git-backed metadata has no Xet data; accepted_etag is the blob id.
             if etag != row.accepted_etag.strip('"').lower():
                 raise ExecutorError(f"{row.filename}: metadata Git identity mismatch")
-        return {"url": url, "commit": commit, "size": size, "etag": etag, "xet_file_hash": xet_hash or None, "body_bytes": 0}
+        return {"url": url, "commit": commit, "size": size, "etag": etag, "metadata_etag": etag, "xet_file_hash": xet_hash or None, "body_bytes": 0}
 
     def _validate_partial_identity(self, row: SourceEntry, meta: Path, length: int, remote: Mapping[str, Any]) -> None:
         if not meta.is_file():
@@ -471,11 +787,21 @@ class Downloader:
         with meta.open("r", encoding="utf-8") as handle:
             identity = json.load(handle)
         expected = self._identity(row, length, remote)
-        for key in ("repository", "revision", "resolved_commit", "filename", "expected_length", "expected_etag", "expected_lfs_oid", "observed_etag", "observed_xet_file_hash", "source_inventory_fingerprint", "acquisition_order"):
+        keys = ("repository", "revision", "resolved_commit", "filename", "expected_length", "source_inventory_fingerprint", "acquisition_order")
+        if row.identity_version >= SOURCE_IDENTITY_VERSION:
+            keys += ("identity_version", "expected_git_blob_id", "expected_lfs_oid_sha256", "expected_xet_file_hash", "allowed_body_etags", "observed_metadata_etag", "observed_xet_file_hash")
+        else:
+            keys += ("expected_etag", "expected_lfs_oid", "observed_etag", "observed_xet_file_hash")
+        for key in keys:
             if identity.get(key) != expected.get(key):
                 raise ResumeRejected(f"partial identity mismatch: {key}")
         if int(identity.get("partial_length", -1)) != length:
             raise ResumeRejected("partial length identity mismatch")
+        if row.identity_version >= SOURCE_IDENTITY_VERSION:
+            observed_body = _clean_identity(identity.get("observed_body_etag"))
+            allowed = {_clean_identity(value) for value in row.allowed_body_etags}
+            if length > 0 and observed_body not in allowed:
+                raise ResumeRejected("partial identity missing allowed observed_body_etag")
 
     def _validate_safetensors_header(self, row: SourceEntry, path: Path) -> None:
         if row.accepted_header_length is None or row.accepted_header_sha256 is None:
@@ -521,6 +847,7 @@ class Downloader:
         *,
         resumed_from: int,
         body_bytes_this_run: int,
+        observed_body_etag: str | None = None,
         recovered_complete_partial: bool = False,
     ) -> dict[str, Any]:
         if partial.stat().st_size != row.byte_length:
@@ -550,15 +877,21 @@ class Downloader:
             "body_bytes_this_run": body_bytes_this_run,
             "resolved_commit": row.revision,
             "expected_etag": row.accepted_etag,
+            "expected_git_blob_id": row.git_blob_id,
+            "expected_lfs_oid_sha256": row.lfs_oid_sha256,
+            "expected_xet_file_hash": row.xet_file_hash,
+            "allowed_body_etags": list(row.allowed_body_etags),
             "observed_etag": remote_meta.get("etag"),
+            "observed_metadata_etag": remote_meta.get("metadata_etag") or remote_meta.get("etag"),
             "observed_xet_file_hash": remote_meta.get("xet_file_hash"),
+            "observed_body_etag": observed_body_etag,
             "expected_lfs_oid": row.lfs_oid_sha256,
             "observed_lfs_oid": row.lfs_oid_sha256,
             "observed_header_length": row.accepted_header_length,
             "observed_header_sha256": row.accepted_header_sha256,
             "recovered_complete_partial": recovered_complete_partial,
         }
-        _atomic_json(receipt, {"entry": asdict(row), **result, "source_inventory_fingerprint": self.manifest.source_inventory_fingerprint, "completion": "SOURCE_COMPLETE"})
+        _atomic_json(receipt, {"entry": asdict(row), "receipt_version": SOURCE_RECEIPT_VERSION, "identity_version": row.identity_version, **result, "source_inventory_fingerprint": self.manifest.source_inventory_fingerprint, "completion": "SOURCE_COMPLETE"})
         return result
 
     def acquire(self, row: SourceEntry) -> dict[str, Any]:
@@ -575,13 +908,22 @@ class Downloader:
         receipt = self.receipt_root / f"{row.acquisition_order:03d}-{row.filename}.receipt.json"
         if final.exists():
             result = self.validate_existing(row, final)
+            receipt_entry = asdict(row)
+            # JSON persists tuples as arrays.  Normalize the expected binding
+            # to that durable representation so a migrated v2 receipt is
+            # accepted on the next restart instead of comparing list vs tuple.
+            receipt_entry["allowed_body_etags"] = list(row.allowed_body_etags)
             receipt_binding = {
-                "entry": asdict(row),
+                "entry": receipt_entry,
                 "final_path": str(final),
                 "expected_bytes": row.byte_length,
                 "bytes": row.byte_length,
                 "resolved_commit": row.revision,
                 "expected_etag": row.accepted_etag,
+                "expected_git_blob_id": row.git_blob_id,
+                "expected_lfs_oid_sha256": row.lfs_oid_sha256,
+                "expected_xet_file_hash": row.xet_file_hash,
+                "allowed_body_etags": list(row.allowed_body_etags),
                 "expected_lfs_oid": row.lfs_oid_sha256,
                 "observed_lfs_oid": row.lfs_oid_sha256,
                 "observed_header_length": row.accepted_header_length,
@@ -593,25 +935,45 @@ class Downloader:
                 try:
                     with receipt.open("r", encoding="utf-8") as handle:
                         prior = json.load(handle)
-                    if prior.get("completion") != "SOURCE_COMPLETE" or any(prior.get(key) != value for key, value in receipt_binding.items()):
-                        raise ExecutorError(f"{row.filename}: source receipt binding mismatch")
-                    accepted_observed = {str(value).strip('"').lower() for value in (row.accepted_etag, row.lfs_oid_sha256) if value}
-                    if str(prior.get("observed_etag", "")).strip('"').lower() not in accepted_observed:
-                        raise ExecutorError(f"{row.filename}: source receipt ETag binding mismatch")
-                    if row.lfs_oid_sha256 and str(prior.get("observed_xet_file_hash", "")).strip('"').lower() != str(row.accepted_etag).strip('"').lower():
-                        raise ExecutorError(f"{row.filename}: source receipt Xet binding mismatch")
-                    resumed = prior.get("resumed_from")
-                    if resumed is not None and not 0 <= int(resumed) <= row.byte_length:
-                        raise ExecutorError(f"{row.filename}: invalid source receipt resume offset")
-                    if int(prior.get("body_bytes", -1)) < 0:
-                        raise ExecutorError(f"{row.filename}: invalid source receipt body byte count")
+                    if prior.get("receipt_version") == SOURCE_RECEIPT_VERSION:
+                        prior_binding = dict(receipt_binding)
+                        if prior.get("completion") != "SOURCE_COMPLETE" or any(prior.get(key) != value for key, value in prior_binding.items()):
+                            raise ExecutorError(f"{row.filename}: source receipt binding mismatch")
+                        accepted_observed = {_clean_identity(value) for value in row.allowed_body_etags}
+                        if _clean_identity(prior.get("observed_body_etag") or prior.get("observed_etag")) not in accepted_observed:
+                            raise ExecutorError(f"{row.filename}: source receipt body ETag binding mismatch")
+                        if _clean_identity(prior.get("observed_metadata_etag") or prior.get("metadata_etag")) != _clean_identity(row.metadata_etag):
+                            raise ExecutorError(f"{row.filename}: source receipt metadata identity mismatch")
+                        if row.xet_file_hash and _clean_identity(prior.get("observed_xet_file_hash")) != _clean_identity(row.xet_file_hash):
+                            raise ExecutorError(f"{row.filename}: source receipt Xet binding mismatch")
+                    else:
+                        # v1 receipt migration is metadata-only.  Resolve the
+                        # immutable source metadata before rewriting its receipt.
+                        if self.execute:
+                            if isinstance(self.transport, UrllibTransport):
+                                remote = self.resolve_hf_metadata(row)
+                            else:
+                                head = self.transport.head(self._url(row), headers={})
+                                try:
+                                    remote = self.validate_metadata(row, head)
+                                finally:
+                                    head.close()
+                        else:
+                            remote = {}
+                        migrate_source_receipt_v1_to_v2(
+                            receipt,
+                            row=row,
+                            source_inventory_fingerprint=self.manifest.source_inventory_fingerprint,
+                            observed_metadata_etag=remote.get("metadata_etag") or remote.get("etag"),
+                            observed_xet_file_hash=remote.get("xet_file_hash"),
+                            observed_body_etag=prior.get("observed_body_etag") or prior.get("observed_etag"),
+                            body_bytes=int(prior.get("body_bytes", 0) or 0),
+                        )
                 except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
                     raise ExecutorError(f"{row.filename}: invalid source receipt") from exc
             else:
-                _atomic_json(receipt, {**receipt_binding, "observed_etag": row.lfs_oid_sha256 or row.accepted_etag, "observed_xet_file_hash": row.accepted_etag, "resumed_from": None, "body_bytes": 0, "completion": "SOURCE_COMPLETE", "recovered_after_promotion": True})
+                _atomic_json(receipt, {**receipt_binding, "receipt_version": SOURCE_RECEIPT_VERSION, "identity_version": row.identity_version, "observed_metadata_etag": row.metadata_etag, "observed_etag": row.metadata_etag, "observed_xet_file_hash": row.xet_file_hash, "observed_body_etag": (row.allowed_body_etags[0] if row.allowed_body_etags else None), "resumed_from": None, "body_bytes": 0, "completion": "SOURCE_COMPLETE", "recovered_after_promotion": True})
             return {"filename": row.filename, **result, "state": "SKIP_VALID_FINAL"}
-        if self.execute and not self.allow_network_body:
-            raise BodyTransferDisabled("execution mode requires explicit network-body authorization")
         if not self.execute:
             if partial.exists() or identity.exists():
                 raise BodyTransferDisabled("dry run cannot inspect/resume body partials")
@@ -645,11 +1007,26 @@ class Downloader:
             )
             return {"filename": row.filename, **result}
         headers: dict[str, str] = {}
+        persisted_body_etag: str | None = None
         if current:
-            validated_etag = str(remote_meta.get("etag") or "")
-            if not validated_etag:
-                raise ResumeRejected("validated remote ETag unavailable for If-Range")
-            headers = {"Range": f"bytes={current}-", "If-Range": validated_etag}
+            try:
+                with identity.open("r", encoding="utf-8") as handle:
+                    persisted = json.load(handle)
+                persisted_value = persisted.get("observed_body_etag") or (persisted.get("observed_etag") if row.identity_version < SOURCE_IDENTITY_VERSION else None)
+                persisted_body_etag = str(persisted_value) if persisted_value is not None else None
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise ResumeRejected("invalid partial identity sidecar") from exc
+            if row.identity_version >= SOURCE_IDENTITY_VERSION and not persisted_body_etag:
+                raise ResumeRejected("validated observed_body_etag unavailable for If-Range")
+            if row.identity_version >= SOURCE_IDENTITY_VERSION:
+                headers = {"Range": f"bytes={current}-", "If-Range": persisted_body_etag}
+            else:
+                # v1 compatibility: its observed_etag represented metadata
+                # identity, so retain the historical If-Range value while v2
+                # uses the exact transport-body ETag above.
+                headers = {"Range": f"bytes={current}-", "If-Range": str(remote_meta.get("etag") or persisted_body_etag or "")}
+        if not self.allow_network_body:
+            raise BodyTransferDisabled("execution mode requires explicit network-body authorization")
         self._semaphore.acquire()
         with self._active_lock:
             self.active += 1
@@ -687,15 +1064,18 @@ class Downloader:
             elif int(rh.get("content-length", "-1")) != row.byte_length:
                 raise ExecutorError("initial Content-Length mismatch")
             etag = rh.get("etag")
-            accepted = {str(value).strip('"').lower() for value in (row.accepted_etag, row.lfs_oid_sha256) if value}
+            accepted = {_clean_identity(value) for value in (row.allowed_body_etags if row.identity_version >= SOURCE_IDENTITY_VERSION else (row.accepted_etag, row.lfs_oid_sha256)) if value}
             if accepted and not etag:
                 raise ExecutorError("body response omitted required ETag identity")
             if etag and accepted and etag.strip('"').lower() not in accepted:
-                raise ExecutorError("body ETag/Xet identity changed")
+                raise ExecutorError("body ETag identity changed")
+            if current and row.identity_version >= SOURCE_IDENTITY_VERSION and persisted_body_etag and _clean_identity(etag) != _clean_identity(persisted_body_etag):
+                raise ResumeRejected("body ETag changed across resume")
+            body_etag = str(etag) if etag is not None else None
             mode = "ab" if current else "wb"
             with partial.open(mode) as target:
                 if not current:
-                    _atomic_json(identity, self._identity(row, 0, remote_meta))
+                    _atomic_json(identity, self._identity(row, 0, remote_meta, observed_body_etag=body_etag))
                 for chunk in response.iter_bytes():
                     if not chunk:
                         continue
@@ -707,7 +1087,7 @@ class Downloader:
                         raise ExecutorError("response body exceeds expected length")
                     target.write(chunk)
                     received += len(chunk)
-                    _atomic_json(identity, self._identity(row, current + received, remote_meta))
+                    _atomic_json(identity, self._identity(row, current + received, remote_meta, observed_body_etag=body_etag))
                 target.flush()
                 os.fsync(target.fileno())
             if current + received != row.byte_length:
@@ -721,6 +1101,7 @@ class Downloader:
                 remote_meta,
                 resumed_from=current,
                 body_bytes_this_run=received,
+                observed_body_etag=body_etag,
             )
             return {"filename": row.filename, **result}
         finally:
@@ -738,7 +1119,10 @@ class Step9BExecutor:
 
     def __init__(self, manifest_path: str | os.PathLike[str], source_root: str | os.PathLike[str], target_root: str | os.PathLike[str], scratch_root: str | os.PathLike[str], logs_root: str | os.PathLike[str], *, builder_commit: str, runtime_worktree: str | os.PathLike[str], runtime_commit: str, source_inventory_fingerprint: str | None = None, source_revision: str = PINNED_REVISION, transfer_cap: int = MAX_TRANSFER_BYTES, toolchain_root: str | os.PathLike[str] | None = None, execute: bool = False, allow_network_body: bool = False, source_retirement_authorized: bool = False, min_disk_free: int = MIN_DISK_RESERVE_BYTES, min_host_free: int = MIN_HOST_FREE_BYTES, max_concurrent_downloads: int = MAX_DOWNLOADS, transport: Transport | None = None):
         self.manifest_path = Path(manifest_path)
-        self.manifest = AcquisitionManifest.load(manifest_path)
+        # Payload execution is canonical only with explicit v2 identities;
+        # dry-run remains able to inspect the frozen v1 plan for compatibility
+        # and migration planning.
+        self.manifest = AcquisitionManifest.load(manifest_path, require_v2=bool(execute))
         if str(source_revision) != self.manifest.revision:
             raise ExecutorError("source revision does not match acquisition manifest")
         if int(transfer_cap) != self.manifest.transfer_cap:
@@ -768,8 +1152,6 @@ class Step9BExecutor:
         self.state: dict[str, Any] = {"mode": "EXECUTE" if execute else "DRY_RUN", "source_retirement_authorized": self.source_retirement_authorized, "stages": {}}
 
     def preflight(self) -> dict[str, Any]:
-        if self.execute and not self.allow_network_body:
-            raise BodyTransferDisabled("--execute requires --allow-network-body")
         if self.source_retirement_authorized:
             # Real Step 9 handoff intentionally sets this false.  A caller may
             # test true only with an explicit, separately reviewed controller.
@@ -983,8 +1365,11 @@ class Step9BExecutor:
                     value = json.load(handle)
             except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
                 raise ExecutorError(f"{row.filename}: source receipt unavailable for component binding") from exc
+            receipt_entry = dict(value.get("entry") or {})
+            if isinstance(receipt_entry.get("allowed_body_etags"), list):
+                receipt_entry["allowed_body_etags"] = tuple(receipt_entry["allowed_body_etags"])
             if (value.get("completion") != "SOURCE_COMPLETE"
-                    or value.get("entry") != asdict(row)
+                    or receipt_entry != asdict(row)
                     or value.get("source_inventory_fingerprint") != self.source_inventory_fingerprint
                     or value.get("resolved_commit") != self.manifest.revision
                     or int(value.get("bytes", -1)) != row.byte_length
@@ -1271,7 +1656,25 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-__all__ = ["AcquisitionManifest", "BodyTransferDisabled", "Downloader", "ExecutorError", "JsonlLogger", "MAX_TRANSFER_BYTES", "SourceEntry", "Step9BExecutor", "TransferBudget", "UrllibTransport", "main"]
+__all__ = [
+    "ACQUISITION_MANIFEST_V1",
+    "ACQUISITION_MANIFEST_V2",
+    "AcquisitionManifest",
+    "BodyTransferDisabled",
+    "Downloader",
+    "ExecutorError",
+    "JsonlLogger",
+    "MAX_TRANSFER_BYTES",
+    "SourceEntry",
+    "Step9BExecutor",
+    "TransferBudget",
+    "UrllibTransport",
+    "generate_acquisition_manifest_v2",
+    "migrate_acquisition_manifest_v1_to_v2",
+    "migrate_source_receipt_v1_to_v2",
+    "normalize_source_entry_mapping",
+    "main",
+]
 
 
 if __name__ == "__main__":
