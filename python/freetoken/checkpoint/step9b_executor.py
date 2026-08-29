@@ -1745,7 +1745,11 @@ class Step9BExecutor:
         self._disk_gate()
         self._host_gate()
         self.target_root.mkdir(parents=True, exist_ok=True)
-        from freetoken.checkpoint.q3_ple import Q3PLEReader, write_q3_ple_from_safetensors
+        from freetoken.checkpoint.q3_ple import (
+            DEFAULT_PROCESSING_CHUNK_ROWS,
+            Q3PLEReader,
+            write_q3_ple_from_safetensors,
+        )
         data_path = self.target_root / "ple-q3-000.bin"
         manifest_path = self.target_root / "ple-q3.json"
         receipt_path = self.scratch_root / "receipts" / "B2-q3.json"
@@ -1764,7 +1768,7 @@ class Step9BExecutor:
                 split_parts=PRODUCTION_PLE_SEGMENT_COUNT,
                 source_fingerprint=self.source_inventory_fingerprint,
                 rows_per_segment=2_500_012,
-                processing_chunk_rows=8192,
+                processing_chunk_rows=DEFAULT_PROCESSING_CHUNK_ROWS,
             )
         if data_path.stat().st_size != Q3_BYTES:
             raise ExecutorError("Q3 target extent mismatch")

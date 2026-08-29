@@ -34,6 +34,7 @@ VERSION = 1
 ALIGN = 4096
 REFINEMENT_PASSES = 2
 DEFAULT_SEGMENT_ROWS = 128
+DEFAULT_PROCESSING_CHUNK_ROWS = 131_072
 
 # Production Qwen4 PLE geometry.  ``segment_count`` is a logical source
 # tensor count; it is deliberately independent from the bounded row chunk used
@@ -199,6 +200,105 @@ def quantize_row(values: Sequence[float], *, refinement_passes: int = REFINEMENT
         quantize_block(values[offset : offset + BLOCK_VALUES], refinement_passes=refinement_passes)
         for offset in range(0, ROW_VALUES, BLOCK_VALUES)
     )
+
+
+def quantize_rows_batched(
+    rows: torch.Tensor,
+    *,
+    device: str | torch.device,
+    refinement_passes: int = REFINEMENT_PASSES,
+) -> bytes:
+    """Encode a bounded ``[rows, 160]`` batch with scalar-codec-exact arithmetic.
+
+    The production PLE source is FP8, so every source value and every product
+    used by the least-squares refinement is exactly representable in float64.
+    ``cumsum(...)[..., -1]`` deliberately preserves the reference encoder's
+    left-to-right Python ``sum`` order.  The stored BF16 scale is rounded by the
+    same integer-bit recipe as :func:`_bf16_bits`, followed by the same final
+    requantization against that stored value.
+
+    The returned bytes retain row-major, five-block-per-row order.  Choosing a
+    CUDA device changes only where the bounded arithmetic executes; it does not
+    change the on-disk format or logical segment identity.
+    """
+
+    if refinement_passes < 0:
+        raise ValueError("refinement_passes must be non-negative")
+    if not isinstance(rows, torch.Tensor) or rows.ndim != 2 or rows.shape[1] != ROW_VALUES:
+        shape = tuple(rows.shape) if isinstance(rows, torch.Tensor) else None
+        raise ValueError(f"expected a [rows, {ROW_VALUES}] tensor, got {shape}")
+    if rows.shape[0] <= 0:
+        raise ValueError("Q3_PLE_32 batch must contain at least one row")
+
+    target = torch.device(device)
+    # The historical source iterator converted FP8 to float32 before Python
+    # materialized each value.  Keep that conversion boundary explicit before
+    # moving to float64 so the batched path has identical source semantics.
+    source = rows.to(dtype=torch.float32).to(device=target, dtype=torch.float64).reshape(
+        -1, BLOCKS_PER_ROW, BLOCK_VALUES
+    )
+    if not bool(torch.isfinite(source).all().item()):
+        raise ValueError("Q3_PLE_32 cannot encode non-finite values")
+
+    minimum = source.amin(dim=-1)
+    maximum = source.amax(dim=-1)
+    scale = torch.maximum(-minimum / 4.0, maximum / 3.0)
+    zero = scale == 0.0
+
+    def codes_for_scale(candidate: torch.Tensor) -> torch.Tensor:
+        safe = torch.where(candidate == 0.0, torch.ones_like(candidate), candidate)
+        codes = torch.round(source / safe.unsqueeze(-1)).clamp_(-4, 3).to(torch.int16) + 4
+        return torch.where((candidate == 0.0).unsqueeze(-1), 4, codes)
+
+    codes = codes_for_scale(scale)
+    done = zero.clone()
+    for _ in range(refinement_passes):
+        quants = codes.to(torch.int16) - 4
+        denominator = (
+            quants.to(torch.int64) * quants.to(torch.int64)
+        ).cumsum(dim=-1)[..., -1]
+        products = source * quants.to(torch.float64)
+        numerator = products.cumsum(dim=-1)[..., -1]
+        refined = torch.where(
+            denominator != 0,
+            numerator / denominator.to(torch.float64),
+            torch.zeros_like(numerator),
+        )
+        valid = (~done) & (denominator != 0) & (refined > 0.0) & torch.isfinite(refined)
+        candidate = torch.where(valid, refined, torch.ones_like(refined))
+        new_codes = codes_for_scale(candidate)
+        same = valid & (new_codes == codes).all(dim=-1)
+        codes = torch.where(valid.unsqueeze(-1), new_codes, codes)
+        scale = torch.where(valid, refined, scale)
+        done |= (~valid) | same
+
+    # Match struct.pack('<f') followed by the reference RN-even BF16 bit rule.
+    float32_scale = scale.to(torch.float32).contiguous()
+    float32_bits = float32_scale.view(torch.int32)
+    scale_bits = (
+        (float32_bits + 0x7FFF + ((float32_bits >> 16) & 1)) >> 16
+    ) & 0xFFFF
+    scale_bits = torch.where((scale > 0.0) & (scale_bits == 0), 1, scale_bits).to(torch.int32)
+    stored_scale = (scale_bits << 16).contiguous().view(torch.float32).to(torch.float64)
+    codes = codes_for_scale(stored_scale)
+
+    output = torch.empty(
+        (source.shape[0], BLOCKS_PER_ROW, BLOCK_BYTES),
+        dtype=torch.uint8,
+        device=target,
+    )
+    output[..., 0] = (scale_bits & 0xFF).to(torch.uint8)
+    output[..., 1] = ((scale_bits >> 8) & 0xFF).to(torch.uint8)
+    packed_codes = codes.to(torch.int64)
+    for group in range(4):
+        packed = torch.zeros_like(scale_bits, dtype=torch.int64)
+        for code_index in range(8):
+            packed |= packed_codes[..., group * 8 + code_index] << (3 * code_index)
+        byte_offset = 2 + group * 3
+        output[..., byte_offset] = (packed & 0xFF).to(torch.uint8)
+        output[..., byte_offset + 1] = ((packed >> 8) & 0xFF).to(torch.uint8)
+        output[..., byte_offset + 2] = ((packed >> 16) & 0xFF).to(torch.uint8)
+    return output.contiguous().cpu().numpy().tobytes()
 
 
 def _unpack_codes(payload: bytes) -> list[int]:
@@ -663,6 +763,8 @@ def write_q3_ple_segmented_sidecar(
     weight_scale: float,
     segment_count: int,
     rows_per_segment: int | None = None,
+    batched: bool = False,
+    quantization_device: str | torch.device | None = None,
 ) -> dict:
     """Write Q3 data with explicit logical source-segment boundaries.
 
@@ -717,18 +819,33 @@ def write_q3_ple_segmented_sidecar(
                 segment_offset = file_offset
                 segment_digest = hashlib.sha256()
                 segment_rows = 0
-                for source_row in source_segment:
-                    row_values = _materialize_row(source_row)
-                    encoded_row = quantize_row(row_values, refinement_passes=REFINEMENT_PASSES)
-                    if len(encoded_row) != ROW_BYTES:
-                        raise AssertionError(f"Q3_PLE_32 row has wrong size: {len(encoded_row)}")
-                    output.write(encoded_row)
-                    whole_digest.update(encoded_row)
-                    payload_digest.update(encoded_row)
-                    segment_digest.update(encoded_row)
-                    file_offset += len(encoded_row)
-                    rows_written += 1
-                    segment_rows += 1
+                for source_item in source_segment:
+                    if batched:
+                        if not isinstance(source_item, torch.Tensor):
+                            raise ValueError("batched Q3_PLE_32 input items must be tensors")
+                        batch_rows = int(source_item.shape[0]) if source_item.ndim == 2 else 0
+                        encoded = quantize_rows_batched(
+                            source_item,
+                            device=quantization_device or "cpu",
+                            refinement_passes=REFINEMENT_PASSES,
+                        )
+                        expected_bytes = batch_rows * ROW_BYTES
+                    else:
+                        row_values = _materialize_row(source_item)
+                        encoded = quantize_row(row_values, refinement_passes=REFINEMENT_PASSES)
+                        batch_rows = 1
+                        expected_bytes = ROW_BYTES
+                    if len(encoded) != expected_bytes:
+                        raise AssertionError(
+                            f"Q3_PLE_32 batch has wrong size: {len(encoded)} != {expected_bytes}"
+                        )
+                    output.write(encoded)
+                    whole_digest.update(encoded)
+                    payload_digest.update(encoded)
+                    segment_digest.update(encoded)
+                    file_offset += len(encoded)
+                    rows_written += batch_rows
+                    segment_rows += batch_rows
                 if segment_rows <= 0:
                     raise ValueError(f"Q3_PLE_32 logical segment {segment_index} is empty")
                 if expected_rows is not None and segment_rows != expected_rows:
@@ -804,11 +921,12 @@ def write_q3_ple_from_safetensors(
     layer_id: int,
     split_parts: int,
     source_fingerprint: str,
-    rows_per_chunk: int = 8192,
+    rows_per_chunk: int = DEFAULT_PROCESSING_CHUNK_ROWS,
     segment_rows: int | None = None,
     processing_chunk_rows: int | None = None,
     segment_count: int | None = None,
     rows_per_segment: int | None = None,
+    quantization_device: str | torch.device | None = None,
 ) -> dict:
     """Stream the official FP8 PLE shards into the native Q3 sidecar.
 
@@ -822,7 +940,7 @@ def write_q3_ple_from_safetensors(
     if not folder.is_dir():
         raise ValueError(f"Q3 PLE source must be a local checkpoint directory: {folder}")
     if processing_chunk_rows is not None:
-        if rows_per_chunk != 8192:
+        if rows_per_chunk != DEFAULT_PROCESSING_CHUNK_ROWS:
             raise ValueError("specify only one of rows_per_chunk or processing_chunk_rows")
         rows_per_chunk = processing_chunk_rows
     if rows_per_chunk <= 0 or split_parts <= 0:
@@ -879,7 +997,7 @@ def write_q3_ple_from_safetensors(
         scale = handle.get_tensor(scale_key).reshape(())
     weight_scale = float(scale.float().item())
 
-    def iter_segment_rows(key: str):
+    def iter_segment_batches(key: str):
         source_file = folder / weight_map[key]
         with safetensors.safe_open(source_file, framework="pt", device="cpu") as handle:
             sliced = handle.get_slice(key)
@@ -894,8 +1012,11 @@ def write_q3_ple_from_safetensors(
                 chunk = sliced[start : min(start + int(rows_per_chunk), shape[0])]
                 if chunk.dtype != torch.float8_e4m3fn:
                     raise ValueError(f"unexpected PLE source dtype for {key}: {chunk.dtype}")
-                for row in chunk.float():
-                    yield row
+                yield chunk
+
+    def iter_segment_rows(key: str):
+        for chunk in iter_segment_batches(key):
+            yield from chunk.float()
 
     # Explicit segmented mode is the production contract.  Legacy callers can
     # request flat row segmentation by passing ``segment_rows`` explicitly.
@@ -914,7 +1035,10 @@ def write_q3_ple_from_safetensors(
     logical_count = int(segment_count if segment_count is not None else split_parts)
     if logical_count != int(split_parts):
         raise ValueError("segment_count must equal split_parts for PLE Safetensors conversion")
-    ordered_segments = (iter_segment_rows(indexed_keys[index]) for index in range(logical_count))
+    selected_device = quantization_device
+    if selected_device is None:
+        selected_device = "cuda" if torch.cuda.is_available() else "cpu"
+    ordered_segments = (iter_segment_batches(indexed_keys[index]) for index in range(logical_count))
     return write_q3_ple_segmented_sidecar(
         ordered_segments,
         data_path,
@@ -923,6 +1047,8 @@ def write_q3_ple_from_safetensors(
         weight_scale=weight_scale,
         segment_count=logical_count,
         rows_per_segment=rows_per_segment,
+        batched=True,
+        quantization_device=selected_device,
     )
 
 
@@ -931,6 +1057,7 @@ __all__ = [
     "BLOCK_BYTES",
     "BLOCK_VALUES",
     "DEFAULT_SEGMENT_ROWS",
+    "DEFAULT_PROCESSING_CHUNK_ROWS",
     "FORMAT",
     "REFINEMENT_PASSES",
     "Q3PLEReader",
@@ -946,6 +1073,7 @@ __all__ = [
     "plan_q3_ple_production",
     "quantize_block",
     "quantize_row",
+    "quantize_rows_batched",
     "write_q3_ple_sidecar",
     "write_q3_ple_segmented_sidecar",
     "write_q3_ple_from_safetensors",

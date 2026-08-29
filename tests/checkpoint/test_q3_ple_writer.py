@@ -23,6 +23,8 @@ from freetoken.checkpoint.q3_ple import (
     PRODUCTION_TOTAL_BYTES,
     PRODUCTION_TOTAL_ROWS,
     quantize_block,
+    quantize_row,
+    quantize_rows_batched,
     plan_q3_ple_production,
     write_q3_ple_from_safetensors,
     write_q3_ple_sidecar,
@@ -115,6 +117,58 @@ def test_writer_payload_is_byte_identical_to_authoritative_reference(z_fixture_d
     )
     assert (z_fixture_dir / "reference.bin").read_bytes() == expected
     assert manifest["file_bytes"] == len(expected)
+
+
+def test_batched_quantizer_is_byte_identical_to_scalar_reference() -> None:
+    generator = torch.Generator().manual_seed(20260829)
+    random_rows = (torch.randn((8192, ROW_VALUES), generator=generator) * 12.0).to(
+        torch.float8_e4m3fn
+    )
+    adversarial = torch.stack(
+        [
+            torch.zeros(ROW_VALUES),
+            torch.arange(-80, 80, dtype=torch.float32) / 8.0,
+            torch.tensor(([0.5, -0.5, 1.5, -1.5] * 40), dtype=torch.float32),
+            torch.full((ROW_VALUES,), 448.0),
+            torch.full((ROW_VALUES,), -448.0),
+        ]
+    ).to(torch.float8_e4m3fn)
+    rows = torch.cat((random_rows, adversarial), dim=0)
+    expected = b"".join(quantize_row(row.float()) for row in rows)
+
+    assert quantize_rows_batched(rows, device="cpu") == expected
+    if torch.cuda.is_available():
+        assert quantize_rows_batched(rows, device="cuda") == expected
+
+
+def test_batched_segmented_writer_matches_scalar_bytes(z_fixture_dir: Path) -> None:
+    rows = (torch.arange(7 * ROW_VALUES, dtype=torch.float32).reshape(7, ROW_VALUES) / 32.0).to(
+        torch.float8_e4m3fn
+    )
+    scalar_manifest = write_q3_ple_segmented_sidecar(
+        ([row.float() for row in rows[:3]], [row.float() for row in rows[3:]]),
+        z_fixture_dir / "scalar.bin",
+        z_fixture_dir / "scalar.json",
+        source_fingerprint="9" * 64,
+        weight_scale=1.0,
+        segment_count=2,
+    )
+    batched_manifest = write_q3_ple_segmented_sidecar(
+        ((rows[:2], rows[2:3]), (rows[3:6], rows[6:])),
+        z_fixture_dir / "batched.bin",
+        z_fixture_dir / "batched.json",
+        source_fingerprint="9" * 64,
+        weight_scale=1.0,
+        segment_count=2,
+        batched=True,
+        quantization_device="cuda" if torch.cuda.is_available() else "cpu",
+    )
+
+    assert (z_fixture_dir / "batched.bin").read_bytes() == (
+        z_fixture_dir / "scalar.bin"
+    ).read_bytes()
+    for key in ("rows", "payload_bytes", "file_bytes", "sha256", "payload_sha256", "segments"):
+        assert batched_manifest[key] == scalar_manifest[key]
 
 
 def test_writer_consumes_rows_once_and_rejects_nonfinite_without_finalizing(z_fixture_dir: Path) -> None:
