@@ -58,6 +58,10 @@ class ResumeRejected(ExecutorError):
     """Raised when the server cannot prove an identity-safe range response."""
 
 
+class AtomicJsonReplaceError(ExecutorError):
+    """A bounded Windows atomic-publication retry exhausted its deadline."""
+
+
 def _sha256(path: Path, chunk: int = 8 << 20) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -91,7 +95,30 @@ def _z_path(path: str | os.PathLike[str], *, must_exist: bool = False) -> Path:
     return resolved
 
 
-def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
+_WINDOWS_REPLACE_TRANSIENT_ERRORS = frozenset({5, 32, 33})
+
+
+def _atomic_json(
+    path: Path,
+    value: Mapping[str, Any],
+    *,
+    replace_attempts: int = 8,
+    replace_deadline_seconds: float = 2.0,
+    replace_backoff_seconds: float = 0.025,
+) -> None:
+    """Durably publish JSON with bounded Windows share-lock recovery.
+
+    The temporary file is closed and fsynced before ``os.replace``.  On
+    Windows, a transient share/access lock can make replace fail with WinError
+    5, 32, or 33.  Retry only those errors for a short bounded window; all
+    other errors fail immediately and the temporary file is intentionally
+    preserved as recovery evidence.  The existing canonical destination is
+    never removed before a successful replace.
+    """
+    if replace_attempts < 1:
+        raise ValueError("replace_attempts must be positive")
+    if replace_deadline_seconds < 0 or replace_backoff_seconds < 0:
+        raise ValueError("replace retry timing must be non-negative")
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_name(f".{path.name}.partial-{os.getpid()}-{threading.get_ident()}")
     with partial.open("w", encoding="utf-8", newline="\n") as handle:
@@ -102,7 +129,27 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
             os.fsync(handle.fileno())
         except OSError:
             pass
-    os.replace(partial, path)
+    started = time.monotonic()
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            os.replace(partial, path)
+            return
+        except OSError as exc:
+            winerror = getattr(exc, "winerror", None)
+            transient = os.name == "nt" and winerror in _WINDOWS_REPLACE_TRANSIENT_ERRORS
+            within_budget = attempt < replace_attempts and (time.monotonic() - started) < replace_deadline_seconds
+            if not transient or not within_budget:
+                if transient:
+                    raise AtomicJsonReplaceError(
+                        f"atomic JSON replace failed after {attempt} attempts; "
+                        f"destination={path}; preserved_orphan={partial}; winerror={winerror}"
+                    ) from exc
+                raise
+            delay = min(replace_backoff_seconds * (2 ** (attempt - 1)), max(0.0, replace_deadline_seconds - (time.monotonic() - started)))
+            if delay:
+                time.sleep(delay)
 
 
 def _publish_component_receipt(receipt_path: Path, value: Mapping[str, Any]) -> dict[str, Any]:
@@ -655,6 +702,9 @@ class Downloader:
         self._cancel = threading.Event()
         self._file_locks: dict[str, threading.Lock] = {}
         self._file_locks_guard = threading.Lock()
+        # Last body-disabled/resume plans are retained for audit and tests;
+        # they contain no payload bytes.
+        self.resume_plans: dict[str, dict[str, Any]] = {}
 
     def _url(self, row: SourceEntry) -> str:
         return f"https://huggingface.co/{row.repository}/resolve/{row.revision}/{row.filename}"
@@ -802,6 +852,158 @@ class Downloader:
             allowed = {_clean_identity(value) for value in row.allowed_body_etags}
             if length > 0 and observed_body not in allowed:
                 raise ResumeRejected("partial identity missing allowed observed_body_etag")
+
+    @staticmethod
+    def _atomic_identity_candidates(identity: Path) -> tuple[Path, ...]:
+        """Return only this executor's atomic-temp siblings, deterministically."""
+        prefix = f".{identity.name}.partial-"
+        return tuple(sorted((item for item in identity.parent.iterdir() if item.is_file() and item.name.startswith(prefix)), key=lambda item: item.name))
+
+    def _completed_source_bytes(self, *, excluding: str | None = None) -> int:
+        """Count exact-length final source files for ledger consistency checks."""
+        total = 0
+        for item in self.manifest.all_entries:
+            if item.filename == excluding:
+                continue
+            final = self.root / item.filename
+            if not final.is_file():
+                continue
+            if final.stat().st_size != item.byte_length:
+                raise ResumeRejected(f"completed source has wrong length: {item.filename}")
+            try:
+                self.validate_existing(item, final)
+            except ExecutorError as exc:
+                raise ResumeRejected(f"completed source failed validation: {item.filename}") from exc
+            total += item.byte_length
+        return total
+
+    def _validate_orphan_identity(
+        self,
+        row: SourceEntry,
+        candidate: Path,
+        partial: Path,
+        remote: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Validate an atomic-temp checkpoint against the complete v2 contract."""
+        try:
+            with candidate.open("r", encoding="utf-8") as handle:
+                value = json.load(handle)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise ResumeRejected(f"invalid orphan identity JSON: {candidate.name}") from exc
+        if not isinstance(value, Mapping):
+            raise ResumeRejected(f"orphan identity is not an object: {candidate.name}")
+        if int(value.get("identity_version", -1)) != SOURCE_IDENTITY_VERSION:
+            raise ResumeRejected("orphan identity schema is not v2")
+        actual_length = partial.stat().st_size
+        expected = self._identity(row, actual_length, remote)
+        required = (
+            "repository", "revision", "resolved_commit", "filename", "expected_length",
+            "source_inventory_fingerprint", "acquisition_order", "identity_version",
+            "expected_git_blob_id", "expected_lfs_oid_sha256", "expected_xet_file_hash",
+            "observed_metadata_etag", "observed_xet_file_hash",
+        )
+        for key in required:
+            if value.get(key) != expected.get(key):
+                raise ResumeRejected(f"orphan identity mismatch: {key}")
+        if int(value.get("partial_length", -1)) != actual_length:
+            raise ResumeRejected("orphan partial length does not match physical partial")
+        declared_allowed = {_clean_identity(item) for item in value.get("allowed_body_etags", ())}
+        expected_allowed = {_clean_identity(item) for item in row.allowed_body_etags}
+        if declared_allowed != expected_allowed:
+            raise ResumeRejected("orphan allowed body ETag set mismatch")
+        observed_body = _clean_identity(value.get("observed_body_etag"))
+        if actual_length and observed_body not in expected_allowed:
+            raise ResumeRejected("orphan observed body ETag is not allowed")
+        # The ledger must account for every validated final source plus this
+        # partial.  It may include retransmitted bytes, hence the >= relation.
+        required_ledger = self._completed_source_bytes(excluding=row.filename) + actual_length
+        if self.budget.transferred < required_ledger:
+            raise ResumeRejected(
+                f"orphan transfer ledger is inconsistent: {self.budget.transferred} < {required_ledger}"
+            )
+        return dict(value)
+
+    def recover_partial_identity_checkpoint(
+        self,
+        row: SourceEntry,
+        *,
+        partial: Path | None = None,
+        identity: Path | None = None,
+        remote: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Fail-closed adoption of a valid executor atomic-temp sidecar.
+
+        Only siblings matching ``.<identity>.partial-*`` are inspected.  A
+        candidate is adopted when it exactly describes the current physical
+        partial and the canonical sidecar is absent or strictly behind it.
+        Ambiguous or invalid candidates are rejected rather than guessed.
+        """
+        partial = partial or (self.root / f"{row.filename}.partial")
+        identity = identity or partial.with_name(partial.name + ".meta.json")
+        if not partial.is_file():
+            return None
+        candidates = self._atomic_identity_candidates(identity)
+        if not candidates:
+            return None
+        if remote is None:
+            if isinstance(self.transport, UrllibTransport):
+                remote = self.resolve_hf_metadata(row)
+            else:
+                head = self.transport.head(self._url(row), headers={})
+                try:
+                    remote = self.validate_metadata(row, head)
+                finally:
+                    head.close()
+        validated: list[tuple[Path, dict[str, Any]]] = []
+        for candidate in candidates:
+            validated.append((candidate, self._validate_orphan_identity(row, candidate, partial, remote)))
+        # All candidates must be semantically identical; otherwise fail closed.
+        baseline = validated[0][1]
+        identity_keys = (
+            "identity_version", "repository", "revision", "resolved_commit", "filename",
+            "expected_length", "expected_git_blob_id", "expected_lfs_oid_sha256",
+            "expected_xet_file_hash", "allowed_body_etags", "observed_metadata_etag",
+            "observed_xet_file_hash", "observed_body_etag", "partial_length",
+            "source_inventory_fingerprint", "acquisition_order",
+        )
+        for _, value in validated[1:]:
+            if any(value.get(key) != baseline.get(key) for key in identity_keys):
+                raise ResumeRejected("AMBIGUOUS ORPHAN CHECKPOINT")
+        canonical_value: dict[str, Any] | None = None
+        if identity.exists():
+            try:
+                with identity.open("r", encoding="utf-8") as handle:
+                    parsed = json.load(handle)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise ResumeRejected("canonical partial identity is malformed") from exc
+            if not isinstance(parsed, Mapping):
+                raise ResumeRejected("canonical partial identity is not an object")
+            canonical_value = dict(parsed)
+            canonical_length = int(canonical_value.get("partial_length", -1))
+            if canonical_length > partial.stat().st_size:
+                raise ResumeRejected("canonical partial identity is ahead of physical partial")
+            for key in identity_keys:
+                if key == "partial_length":
+                    continue
+                if canonical_value.get(key) != baseline.get(key):
+                    raise ResumeRejected(f"canonical/orphan checkpoint conflict: {key}")
+            if canonical_length == partial.stat().st_size:
+                return {"state": "ALREADY_CURRENT", "candidate": str(validated[0][0]), "partial_length": partial.stat().st_size}
+            if canonical_length >= int(baseline.get("partial_length", -1)):
+                raise ResumeRejected("canonical partial identity is not strictly behind orphan")
+        # Publish the validated orphan contents through the hardened helper.
+        _atomic_json(identity, baseline)
+        with identity.open("r", encoding="utf-8") as handle:
+            adopted = json.load(handle)
+        if int(adopted.get("partial_length", -1)) != partial.stat().st_size:
+            raise ResumeRejected("adopted canonical partial identity changed unexpectedly")
+        return {
+            "state": "ADOPTED",
+            "candidate": str(validated[0][0]),
+            "partial_length": partial.stat().st_size,
+            "canonical_was_present": canonical_value is not None,
+            "body_bytes": 0,
+        }
 
     def _validate_safetensors_header(self, row: SourceEntry, path: Path) -> None:
         if row.accepted_header_length is None or row.accepted_header_sha256 is None:
@@ -990,7 +1192,18 @@ class Downloader:
                 head.close()
         current = partial.stat().st_size if partial.exists() else 0
         if partial.exists() != identity.exists():
-            raise ResumeRejected(f"partial and identity sidecar must exist together for {row.filename}")
+            # A process crash can leave a valid atomic-temp identity sidecar
+            # beside the body partial while the canonical replace is pending.
+            # Recover it before enforcing the pair invariant.
+            if partial.exists() and not identity.exists():
+                self.recover_partial_identity_checkpoint(row, partial=partial, identity=identity, remote=remote_meta)
+            if partial.exists() != identity.exists():
+                raise ResumeRejected(f"partial and identity sidecar must exist together for {row.filename}")
+        elif partial.exists():
+            # The canonical sidecar may lag the body after a sharing-lock
+            # failure.  This call is a no-op when no orphan is present.
+            self.recover_partial_identity_checkpoint(row, partial=partial, identity=identity, remote=remote_meta)
+            current = partial.stat().st_size
         if current or partial.exists():
             self._validate_partial_identity(row, identity, current, remote_meta)
         if current == row.byte_length:
@@ -1025,6 +1238,16 @@ class Downloader:
                 # identity, so retain the historical If-Range value while v2
                 # uses the exact transport-body ETag above.
                 headers = {"Range": f"bytes={current}-", "If-Range": str(remote_meta.get("etag") or persisted_body_etag or "")}
+            plan = {
+                "filename": row.filename,
+                "range_start": current,
+                "remaining_bytes": row.byte_length - current,
+                "if_range": persisted_body_etag,
+                "body_request_authorized": bool(self.allow_network_body),
+            }
+            self.resume_plans[row.filename] = plan
+            if self.logger:
+                self.logger.event("resume_plan", **plan)
         if not self.allow_network_body:
             raise BodyTransferDisabled("execution mode requires explicit network-body authorization")
         self._semaphore.acquire()
@@ -1259,6 +1482,12 @@ class Step9BExecutor:
             if name.endswith(".partial") and name[:-8] in allowed:
                 continue
             if name.endswith(".partial.meta.json") and name[:-18] in allowed:
+                continue
+            # Atomic JSON publication uses an executor-owned hidden sibling
+            # (``.<destination>.partial-<pid>-<thread>``).  Keep these
+            # restartable checkpoints in scope for orphan recovery; arbitrary
+            # hidden JSON remains rejected below.
+            if any(name.startswith(f".{item}.partial.meta.json.partial-") for item in allowed):
                 continue
             raise ExecutorError(f"unexpected source workspace file: {name}")
 
