@@ -397,6 +397,15 @@ public:
   }
 
   template <DLDeviceType... Codes>
+  auto with_device(SymbolicDevice &device) && -> TensorMatcher && {
+    m_init_device();
+    if constexpr (sizeof...(Codes) > 0) {
+      device.set_options<Codes...>();
+    }
+    m_device.rebind(device);
+    return std::move(*this);
+  }
+
   auto with_device(DeviceRef &&device) && -> TensorMatcher && {
     m_init_device();
     m_device.rebind(*device);

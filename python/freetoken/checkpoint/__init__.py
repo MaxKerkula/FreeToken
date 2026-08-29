@@ -7,13 +7,25 @@ for the safetensors -> FTW converter (also exposed as ``ft checkpoint``).
 from .ftw import (
     FTWReader,
     FTWWriter,
+    ensure_ftw_terminal_padding,
     is_ftw_checkpoint,
     iter_ftw_weights,
     load_ftw_banks,
 )
 from .convert import convert_checkpoint
+from .q3_ple import (
+    Q3PLEReader,
+    Q3PLESegment,
+    plan_q3_ple_production,
+    write_q3_ple_segmented_sidecar,
+    write_q3_ple_from_safetensors,
+    write_q3_ple_sidecar,
+)
 
 __all__ = [
-    "FTWReader", "FTWWriter", "is_ftw_checkpoint",
+    "FTWReader", "FTWWriter", "ensure_ftw_terminal_padding", "is_ftw_checkpoint",
     "iter_ftw_weights", "load_ftw_banks", "convert_checkpoint",
+    "Q3PLEReader", "Q3PLESegment", "write_q3_ple_sidecar",
+    "write_q3_ple_segmented_sidecar", "write_q3_ple_from_safetensors",
+    "plan_q3_ple_production",
 ]

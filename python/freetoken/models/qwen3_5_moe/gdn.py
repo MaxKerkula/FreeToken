@@ -53,7 +53,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
     def __init__(
         self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
         conv_kernel_size, rms_norm_eps, layer_id, expert_quant: str = "none",
-        attn_quant: str = "none",
+        attn_quant: str = "none", *, nvfp4_qkvz: bool = False,
     ):
         self.layer_id = layer_id
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
@@ -71,16 +71,25 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self.value_dim = num_v_heads * head_v_dim
         self.conv_dim = 2 * self.key_dim + self.value_dim
         self.conv_kernel_size = conv_kernel_size
-        # qkv|z carry a weight scale (block-fp8 weight_scale_inv, or per-tensor FP8
-        # weight_scale); b|a stay bf16. Both quant modes therefore split the four-way
-        # fusion into an fp8 qkvz GEMM + a bf16 ba GEMM (matches sglang/vLLM).
+        # qkv|z carry a weight scale (block-fp8 weight_scale_inv, per-tensor FP8
+        # weight_scale, or native NVFP4 scales); b|a stay bf16. The explicit
+        # ``nvfp4_qkvz`` opt-in is used by Qwen4 only. Keeping it separate from
+        # ``attn_quant`` preserves Qwen3.5's historical NVFP4 behavior (where only
+        # out_proj is native FP4).
         self._block_fp8 = expert_quant == "fp8_block"
         self._pertensor_fp8 = attn_quant == "fp8_pertensor"
+        self._nvfp4_qkvz = bool(nvfp4_qkvz)
         self._fp8 = self._block_fp8 or self._pertensor_fp8
+        self._split_input = self._fp8 or self._nvfp4_qkvz
 
         self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
-        if self._fp8:
-            ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
+        if self._split_input:
+            if self._nvfp4_qkvz:
+                from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged
+
+                ColMerged = Nvfp4DenseColMerged
+            else:
+                ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
             self.in_proj_qkvz = ColMerged(
                 hidden_size, [self.conv_dim, self.value_dim], has_bias=False
             )
@@ -98,9 +107,9 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self.dt_bias = torch.empty(num_v_heads, dtype=torch.float32)
         self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
         self.norm = _GatedRMSNorm(head_v_dim, eps=rms_norm_eps)
-        # out_proj follows the checkpoint quant: block-fp8 / per-tensor-fp8 / compressed-tensors
-        # NVFP4 (W4A16) / bf16. in_proj_* stay bf16 in every mode (above), so a compressed-tensors
-        # NVFP4 checkpoint (attn_quant=="nvfp4") only makes out_proj native FP4.
+        # out_proj follows the checkpoint quant: block-fp8 / per-tensor-fp8 / NVFP4 (W4A16) /
+        # bf16. In Qwen4's explicit ``nvfp4_qkvz`` mode, qkv|z is native NVFP4 while b|a
+        # remains BF16; Qwen3.5 callers retain the historical fused-BF16 input path.
         self.out_proj = make_replicated_quant(
             expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
         )
@@ -161,7 +170,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device)
             batch.fla_metadata = fla
 
-        if self._fp8:
+        if self._split_input:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
             conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
             ba = self.in_proj_ba.forward(hidden_states)

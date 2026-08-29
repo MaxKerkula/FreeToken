@@ -195,6 +195,15 @@ class OffloadMoeCache:
         self.bank_schema = _BANK_SCHEMAS[self.quant_format]
         self.bank_sources: dict[str, list[torch.Tensor]] = {}
         self.bank_caches: dict[str, torch.Tensor] = {}
+        # Optional true file-backed tier.  Unlike ``bank_sources`` these entries
+        # never point at a full-layer HostBank; one aligned record is fetched per
+        # miss into the existing slot cache.  The source object is deliberately
+        # kept separate so CPU/hybrid callers cannot accidentally treat a tier as
+        # pageable resident memory.
+        self.file_sources = {}
+        self._pending_file_fetches: list[tuple[int, int]] = []
+        self._pending_file_materialize = False
+        self._pending_file_rollback = None
         # per-layer host residency: the GPU movement paths require "pinned"; LOCKED/PAGEABLE layers decode on the CPU executor and prefill via copy_missing's pageable branch
         # _unpinned_layers is the derived id set the hot paths test against
         self.layer_residency: list[str] = []
@@ -277,7 +286,7 @@ class OffloadMoeCache:
 
     def set_bank_sources(
         self,
-        sources: dict[str, list[torch.Tensor]],
+        sources: dict[str, list[torch.Tensor | None]],
         layer_residency: list[str] | None = None,
     ) -> None:
         """Attach the host (CPU pinned) expert source banks and allocate a GPU slot
@@ -321,8 +330,16 @@ class OffloadMoeCache:
         for name in self.bank_schema:
             per_layer = sources[name]
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
-            head = per_layer[0]
+            heads = [source for source in per_layer if source is not None]
+            if not heads:
+                raise ValueError(f"bank {name!r} has no resident shape; attach a file source")
+            head = heads[0]
             for layer_id, source in enumerate(per_layer):
+                if source is None:
+                    # A None row is an explicit file-tier placeholder.  The
+                    # corresponding layer must be registered with set_file_sources
+                    # before any request reaches it.
+                    continue
                 assert source.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
                 assert source.size(0) == self.num_experts, (name, layer_id, source.shape)
                 assert source.shape == head.shape and source.dtype == head.dtype, (
@@ -338,6 +355,65 @@ class OffloadMoeCache:
         self._build_copy_plan()
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+
+    def set_file_sources(self, sources: dict[int, object]) -> None:
+        """Register GPU-only, fixed-record expert tiers by MoE layer.
+
+        ``set_bank_sources`` must contain ``None`` placeholders for these layers,
+        which makes the absence of a HostBank explicit.  File tiers are never
+        valid for CPU/hybrid decode or prefill overlap because both paths require
+        resident host tensors and CUDA graph capture cannot contain synchronous
+        file I/O.
+        """
+        # A mixed cache may use the CPU executor for selected resident layers,
+        # but a file-backed layer itself is always GPU-only.  The per-layer set is
+        # the precise invariant; rejecting the entire cache would unnecessarily
+        # disable existing CPU/hybrid support for resident HostBanks.
+        requested = {int(layer) for layer in sources}
+        if requested & set(self.cpu_layer_ids):
+            raise ValueError(
+                "file-backed expert tiers are GPU-only; CPU/hybrid layers must be resident"
+            )
+        if self.prefill_overlap:
+            raise ValueError("file-backed expert tiers require prefill_overlap=False")
+        if not sources:
+            return
+        if not self.bank_sources:
+            # A pure file-tier fixture (and a future all-file policy) has no
+            # resident HostBank from which to infer cache-plane geometry.  The
+            # source contract supplies the exact per-expert native plane specs.
+            representative = next(iter(sources.values()))
+            if tuple(getattr(representative, "bank_schema", ())) != tuple(self.bank_schema):
+                raise ValueError("file tier bank schema does not match cache quant_format")
+            specs = getattr(representative, "plane_specs", None)
+            if not isinstance(specs, dict):
+                raise ValueError("file source does not declare native plane_specs")
+            for name in self.bank_schema:
+                shape, dtype = specs[name]
+                self.bank_sources[name] = [None] * self.num_layers
+                self.bank_caches[name] = torch.empty(
+                    (self.cache_size, *shape), dtype=dtype, device=self.device
+                )
+            self.banks = [
+                (self.bank_sources[name], self.bank_caches[name]) for name in self.bank_schema
+            ]
+            self._build_copy_plan()
+        for layer_id, source in sources.items():
+            layer_id = int(layer_id)
+            if not 0 <= layer_id < self.num_layers:
+                raise ValueError(f"file tier layer {layer_id} outside cache geometry")
+            if not hasattr(source, "bank_schema") or tuple(source.bank_schema) != tuple(self.bank_schema):
+                raise ValueError("file tier bank schema does not match cache quant_format")
+            if int(source.num_experts) != self.num_experts:
+                raise ValueError("file tier expert count does not match cache geometry")
+            if int(getattr(source, "layer_id", -1)) != layer_id:
+                raise ValueError(
+                    f"file tier declares layer {getattr(source, 'layer_id', None)}, registered as {layer_id}"
+                )
+            for name in self.bank_schema:
+                if self.bank_sources[name][layer_id] is not None:
+                    raise ValueError(f"layer {layer_id} already has a resident HostBank for {name}")
+            self.file_sources[layer_id] = source
 
     def _build_copy_plan(self) -> None:
         """Precompute the fused multi-bank copy descriptor (base addrs + per-row bytes).
@@ -364,7 +440,10 @@ class OffloadMoeCache:
         dst_ptrs, feats = [], []
         layer_src_ptrs = [[] for _ in range(self.num_layers)]
         for per_layer, cache in self.banks:
-            feat = math.prod(per_layer[0].shape[1:]) * per_layer[0].element_size()
+            head = next((source for source in per_layer if source is not None), None)
+            if head is None:
+                return
+            feat = math.prod(head.shape[1:]) * head.element_size()
             if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
                 return  # leave fused disabled; copy_missing uses the per-bank path
             for layer_id, source in enumerate(per_layer):
@@ -376,6 +455,12 @@ class OffloadMoeCache:
                 # The kernel dereferences these on the GPU, so store each host bank's
                 # device alias (== data_ptr() under UVA identity; differs on
                 # Windows/WDDM).
+                if source is None:
+                    # A file-tier layer has no host pointer and is never passed
+                    # through the CUDA copy kernel; copy_missing dispatches its
+                    # synchronous record reader below.
+                    layer_src_ptrs[layer_id].append(0)
+                    continue
                 src_dev = device_ptr(source)
                 if src_dev % 16 != 0:
                     return
@@ -448,9 +533,18 @@ class OffloadMoeCache:
             torch.cuda.empty_cache()
         # 3. Reallocate the slot cache from the retained host sources.
         for name in self.bank_schema:
-            head = self.bank_sources[name][0]
+            head = next(
+                (source for source in self.bank_sources[name] if source is not None), None
+            )
+            if head is None:
+                representative = next(iter(self.file_sources.values()), None)
+                if representative is None:
+                    raise ValueError(f"bank {name!r} has no source shape for rebuild")
+                shape, dtype = representative.plane_specs[name]
+            else:
+                shape, dtype = head.shape[1:], head.dtype
             self.bank_caches[name] = torch.empty(
-                (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
+                (cache_size, *shape), dtype=dtype, device=self.device
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
@@ -798,6 +892,9 @@ class OffloadMoeCache:
         self._prefill_buffer_released[buffer_id] = True
 
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        if layer_id in self.file_sources:
+            self.ensure_file_experts(layer_id, expert_ids)
+            return
         from freetoken.moe.offload_kernels import ensure_experts
 
         if self.collect_decode_freq:
@@ -808,6 +905,62 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
+
+    def ensure_file_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        """Host-bookkeep file-tier misses and rewrite IDs to GPU cache slots.
+
+        This path intentionally performs a bounded host sync and is not CUDA-graph
+        capturable.  Qwen4 disables graph capture when a file source is attached;
+        callers that cannot make that guarantee must reject the configuration.
+        """
+        if layer_id not in self.file_sources:
+            raise ValueError(f"layer {layer_id} has no file source")
+        if self.decode_target != "gpu":
+            raise RuntimeError("file-backed experts cannot serve CPU/hybrid decode")
+        original_shape = tuple(expert_ids.shape)
+        # File reads happen after the host-side slot plan is installed.  Retain
+        # the small bookkeeping tensors so an I/O error cannot expose a cache
+        # slot whose six planes were never completely populated.
+        rollback = (
+            self.slot_for_id.clone(),
+            self.id_of_slot.clone(),
+            self.usage.clone(),
+            self.step.clone(),
+        )
+        raw_ids = [int(value) for value in expert_ids.detach().cpu().reshape(-1).tolist()]
+        self.step += 1
+        step = int(self.step.item())
+        mapped: list[int] = []
+        pending: list[tuple[int, int]] = []
+        for expert_id in raw_ids:
+            if not 0 <= expert_id < self.num_experts:
+                raise IndexError(f"expert_id {expert_id} outside cache geometry")
+            slot = int(self.slot_for_id[layer_id, expert_id].item())
+            if slot < 0:
+                free = torch.nonzero(self.id_of_slot < 0, as_tuple=False).reshape(-1)
+                if free.numel():
+                    slot = int(free[0].item())
+                else:
+                    slot = int(torch.argmin(self.usage).item())
+                    old = int(self.id_of_slot[slot].item())
+                    if old >= 0:
+                        self.slot_for_id.view(-1)[old] = -1
+                flat_id = layer_id * self.num_experts + expert_id
+                self.slot_for_id[layer_id, expert_id] = slot
+                self.id_of_slot[slot] = flat_id
+                pending.append((slot, expert_id))
+            self.usage[slot] = step
+            mapped.append(slot)
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        self._pending_file_materialize = False
+        # ``copy_missing`` has no use for the LRU scratch arrays on this path, but
+        # keep num_indices truthful for diagnostics and callers that inspect it.
+        self.num_indices[0] = len(pending)
+        self._pending_file_fetches = pending
+        self._pending_file_rollback = rollback if pending else None
+        replacement = torch.tensor(mapped, dtype=expert_ids.dtype, device=expert_ids.device).reshape(original_shape)
+        expert_ids.copy_(replacement)
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
@@ -831,6 +984,31 @@ class OffloadMoeCache:
         )
 
     def materialize_layer(self, layer_id: int) -> None:
+        if layer_id in self.file_sources:
+            if self.cache_size < self.num_experts:
+                raise RuntimeError("file-tier prefill requires one slot per expert")
+            self._pending_file_rollback = (
+                self.slot_for_id.clone(),
+                self.id_of_slot.clone(),
+                self.usage.clone(),
+                self.step.clone(),
+            )
+            self.step += 1
+            step = int(self.step.item())
+            self.slot_for_id[layer_id].fill_(-1)
+            for expert_id in range(self.num_experts):
+                slot = expert_id
+                old = int(self.id_of_slot[slot].item())
+                if old >= 0:
+                    self.slot_for_id.view(-1)[old] = -1
+                self.slot_for_id[layer_id, expert_id] = slot
+                self.id_of_slot[slot] = layer_id * self.num_experts + expert_id
+                self.usage[slot] = step
+            self._pending_src_layer = layer_id
+            self._pending_whole_layer = True
+            self._pending_file_materialize = True
+            self._pending_file_fetches = []
+            return
         from freetoken.moe.offload_kernels import materialize_layer
 
         self._pending_src_layer = layer_id
@@ -838,12 +1016,25 @@ class OffloadMoeCache:
         materialize_layer(self, layer_id)
 
     def reset(self) -> None:
-        from freetoken.moe.offload_kernels import reset_cache
+        if self.device.type == "cuda":
+            from freetoken.moe.offload_kernels import reset_cache
 
-        reset_cache(self)
+            reset_cache(self)
+        else:
+            # The production path is CUDA-only, but a CPU synthetic FileExpertSource
+            # fixture still needs deterministic reset/reuse semantics without
+            # attempting to launch a Triton kernel on a CPU tensor.
+            self.slot_for_id.fill_(-1)
+            self.id_of_slot.fill_(-1)
+            self.usage.zero_()
+            self.step.zero_()
+            self.num_indices.zero_()
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
+        self._pending_file_fetches = []
+        self._pending_file_materialize = False
+        self._pending_file_rollback = None
 
     def reset_stats(self) -> None:
         self.prefill_hit_rows = 0
@@ -969,6 +1160,33 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        if layer_id in self.file_sources:
+            source = self.file_sources[layer_id]
+            if self._pending_file_materialize:
+                pairs = [(expert_id, expert_id) for expert_id in range(self.num_experts)]
+            else:
+                pairs = list(self._pending_file_fetches)
+            destinations = {
+                name: cache for name, (_, cache) in zip(self.bank_schema, self.banks)
+            }
+            try:
+                for slot, expert_id in pairs:
+                    source.read_into(expert_id, destinations, slot)
+            except Exception:
+                if self._pending_file_rollback is not None:
+                    slot_for_id, id_of_slot, usage, step = self._pending_file_rollback
+                    self.slot_for_id.copy_(slot_for_id)
+                    self.id_of_slot.copy_(id_of_slot)
+                    self.usage.copy_(usage)
+                    self.step.copy_(step)
+                self._pending_file_fetches = []
+                self._pending_file_materialize = False
+                self._pending_file_rollback = None
+                raise
+            self._pending_file_fetches = []
+            self._pending_file_materialize = False
+            self._pending_file_rollback = None
+            return
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 raise RuntimeError(

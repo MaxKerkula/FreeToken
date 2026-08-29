@@ -87,6 +87,14 @@ def test_qwen3_5_is_not_shadowed_by_the_generic_qwen_branch():
     assert _inferred("Qwen3MoeForCausalLM")[0] == "qwen25"
 
 
+@pytest.mark.parametrize(
+    "architecture",
+    ["Qwen4ExpForConditionalGeneration", "qwen4_exp"],
+)
+def test_qwen4_exp_uses_qwen3_coder_tool_parser(architecture):
+    assert _inferred(architecture)[0] == "qwen3_coder"
+
+
 def test_an_explicit_choice_beats_inference():
     config = _Config({"architectures": ["DeepseekV4ForCausalLM"], "torch_dtype": "bfloat16"})
     with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):

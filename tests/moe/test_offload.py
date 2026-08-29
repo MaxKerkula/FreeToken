@@ -415,7 +415,9 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size():
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.float16,
-        attention_backend="fi",
+        # This test exercises MoE cache-rate conversion, not FlashInfer package
+        # discovery; keep it runnable in the project-local component-test env.
+        attention_backend="triton",
         moe_cache_rate=0.3,
     )
     object.__setattr__(

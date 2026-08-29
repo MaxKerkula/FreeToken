@@ -9,6 +9,7 @@ from freetoken.models.config import (
     RotaryConfig,
     detect_expert_quant,
 )
+from freetoken.checkpoint.qwen4_artifact import qwen4_text_only_marker
 
 from .args import Qwen4ExpArgs, Qwen4VisionConfig
 
@@ -94,7 +95,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
             "Qwen4-Exp mrope_section must cover the rotary dimension: "
             f"{qwen4_args.mrope_section} vs {rotary_dim}"
         )
-    raw_vision = getattr(hf_config, "vision_config", None)
+    # A modular Qwen4 artifact is explicitly text-only.  Keep the ordinary source
+    # checkpoint behavior untouched (vision remains part of the parsed model) and
+    # fail closed on an unknown target marker in qwen4_text_only_marker().
+    text_only = qwen4_text_only_marker(hf_config)
+    raw_vision = None if text_only else getattr(hf_config, "vision_config", None)
     vision_config = None
     if raw_vision is not None:
         vision_config = Qwen4VisionConfig(
@@ -143,6 +148,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
             f"detected {detected_quant!r}"
         )
 
+    active_quant = getattr(hf_config, "freetoken_active_quant", None)
+    if active_quant not in (None, "nvfp4_w4a16_v1"):
+        raise ValueError(f"unsupported Qwen4 active-weight format: {active_quant}")
+    active_linear_quant = "nvfp4" if active_quant == "nvfp4_w4a16_v1" else "none"
+
     return ModelConfig(
         num_layers=int(text.num_hidden_layers),
         num_qo_heads=int(text.num_attention_heads),
@@ -159,24 +169,25 @@ def parse_config(hf_config: Any) -> ModelConfig:
         num_experts_per_tok=int(text.num_experts_per_tok),
         moe_intermediate_size=int(text.moe_intermediate_size),
         shared_expert_intermediate_size=int(text.shared_expert_intermediate_size),
-        # The released Qwen3.8-Flash-Next configs omit this older Qwen MoE
-        # field. Omission means that the router weights are not renormalized.
-        norm_topk_prob=bool(getattr(text, "norm_topk_prob", False)),
+        # The official Qwen4-Exp config defaults this field to True. Released
+        # checkpoints may omit it, while an explicit False must remain False.
+        norm_topk_prob=bool(getattr(text, "norm_topk_prob", True)),
         model_type=str(hf_config.model_type),
         architectures=list(hf_config.architectures),
         moe_enabled=True,
         expert_quant=expert_quant,
         weight_block_size=block_size,
-        # Only routed experts and PLE are FP8 in the official checkpoint. All
-        # attention, hyper-connection, and shared-expert projections stay BF16.
-        attn_quant="none",
-        dense_quant="none",
+        # The published experts-only checkpoint has no active-weight marker and
+        # therefore retains BF16 operators.  Only the canonical preconverted
+        # FTW artifact may opt into the frozen native W4A16 map.
+        attn_quant=active_linear_quant,
+        dense_quant=active_linear_quant,
         lm_head_quant="none",
         use_qk_norm=True,
         # Qwen3.8-Flash-Next is a VL checkpoint. Vision is part of this model,
         # not an optional text-only add-on.
         vision_config=vision_config,
-        image_token_id=getattr(hf_config, "image_token_id", None),
+        image_token_id=None if text_only else getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         qwen4_args=qwen4_args,
         # PLE keeps per-request dilated-convolution state outside the generic

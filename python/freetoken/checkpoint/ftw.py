@@ -39,6 +39,8 @@ import os
 import re
 import sys
 import threading
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -58,6 +60,7 @@ _ALPHA_NAMES = ("gate_up_alpha", "down_alpha")
 # Per-layer expert-bank entry name (converter streaming path, see checkpoint/convert.py):
 # each layer of a bank is its own FTW tensor instead of one flat [num_layers*E, ...] region.
 _LAYER_ENTRY_RE = re.compile(r"^(?P<base>.+)#L(?P<layer>\d{5})$")
+_WINDOWS_REPLACE_TRANSIENT_ERRORS = frozenset({5, 32, 33})
 
 
 def layer_bank_entry_name(bank_name: str, layer_id: int) -> str:
@@ -104,6 +107,300 @@ def _elsize(dt: torch.dtype) -> int:
 def is_ftw_checkpoint(path: str) -> bool:
     """True if ``path`` is a directory holding a FreeToken Weight (FTW) index."""
     return os.path.isfile(os.path.join(path, INDEX_NAME))
+
+
+def _atomic_json_document(path: str, document: dict, *, attempts: int = 8,
+                          deadline_seconds: float = 2.0,
+                          backoff_seconds: float = 0.025) -> None:
+    """Durably publish one JSON document beside its destination.
+
+    FTW terminal-padding recovery updates the index only after the shard tail is
+    durable.  The replacement is therefore the final publication step.  Keep the
+    previous index intact if replacement fails, and retain the temporary document so
+    a later recovery pass can inspect it.  The bounded Windows retry mirrors the
+    executor's atomic receipt path without coupling this low-level format module to
+    the orchestration module.
+    """
+    if attempts < 1:
+        raise ValueError("attempts must be positive")
+    if deadline_seconds < 0 or backoff_seconds < 0:
+        raise ValueError("retry timing must be non-negative")
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    temporary = os.path.join(
+        parent,
+        f".{os.path.basename(path)}.padding-{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex}",
+    )
+    with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(document, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+
+    started = time.monotonic()
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            os.replace(temporary, path)
+            return
+        except OSError as exc:
+            winerror = getattr(exc, "winerror", None)
+            if winerror is None:
+                winerror = getattr(exc, "errno", None)
+            transient = os.name == "nt" and winerror in _WINDOWS_REPLACE_TRANSIENT_ERRORS
+            if not transient:
+                raise
+            if attempt >= attempts or time.monotonic() - started >= deadline_seconds:
+                raise OSError(
+                    f"FTW index atomic replacement failed after {attempt} attempts; "
+                    f"destination={path}; preserved_temp={temporary}; winerror={winerror}"
+                ) from exc
+            delay = min(
+                backoff_seconds * (2 ** (attempt - 1)),
+                max(0.0, deadline_seconds - (time.monotonic() - started)),
+            )
+            if delay:
+                time.sleep(delay)
+
+
+def _read_ftw_index(path: str) -> tuple[str, dict]:
+    root = os.fspath(path)
+    if not os.path.isdir(root):
+        raise ValueError(f"FTW checkpoint directory is missing: {root}")
+    index_path = os.path.join(root, INDEX_NAME)
+    try:
+        with open(index_path, "r", encoding="utf-8") as handle:
+            index = json.load(handle)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read FTW index: {index_path}") from exc
+    if not isinstance(index, dict):
+        raise ValueError("FTW index must be a JSON object")
+    try:
+        version = int(index.get("version", -1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("FTW index version is invalid") from exc
+    if index.get("format") != FORMAT_TAG or version != FORMAT_VERSION:
+        raise ValueError("terminal padding requires FTW format version 1")
+    return index_path, index
+
+
+def _remove_redundant_padding_indexes(index_path: str, published: dict) -> None:
+    """Remove only exact stale copies produced by terminal-padding publication.
+
+    A failed Windows replace intentionally preserves its complete temporary JSON.  Once
+    a later recovery publishes the same document, leaving that temporary file inside
+    the FTW directory would make it an unintended artifact component.  Conflicting or
+    malformed candidates are never guessed away; they fail closed for operator review.
+    """
+    parent = os.path.dirname(index_path) or "."
+    prefix = f".{os.path.basename(index_path)}.padding-"
+    redundant: list[str] = []
+    for name in sorted(os.listdir(parent)):
+        if not name.startswith(prefix):
+            continue
+        candidate = os.path.join(parent, name)
+        try:
+            with open(candidate, "r", encoding="utf-8") as handle:
+                document = json.load(handle)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"conflicting FTW terminal-padding temp: {candidate}") from exc
+        if document != published:
+            raise ValueError(f"conflicting FTW terminal-padding temp: {candidate}")
+        redundant.append(candidate)
+    # Validate the complete candidate set before mutating it.  A conflict therefore
+    # preserves every sibling document for deterministic operator inspection.
+    for candidate in redundant:
+        os.unlink(candidate)
+
+
+def _validate_ftw_geometry(root: str, index: dict, *, align: int) -> tuple[list[dict], list[int], int]:
+    """Validate shard/tensor geometry without reading tensor payloads."""
+    try:
+        indexed_align = int(index.get("align", -1))
+        total = int(index.get("total_bytes", -1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("FTW alignment/total geometry is invalid") from exc
+    if indexed_align != align:
+        raise ValueError("terminal padding requires the FTW alignment")
+    if total < 0 or total % align:
+        raise ValueError("FTW total_bytes must be a non-negative aligned integer")
+    shards = index.get("shards")
+    if not isinstance(shards, list) or not shards:
+        raise ValueError("FTW index has no shards")
+    if any(not isinstance(item, dict) for item in shards):
+        raise ValueError("FTW shard entry must be an object")
+    try:
+        ordered = sorted(shards, key=lambda item: int(item.get("global_off", -1)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("FTW shard global offset is invalid") from exc
+    if ordered != shards:
+        raise ValueError("FTW shards are not in global offset order")
+    expected_offset = 0
+    physical_sizes: list[int] = []
+    for shard in ordered:
+        if not isinstance(shard, dict):
+            raise ValueError("FTW shard entry must be an object")
+        name = shard.get("file")
+        try:
+            global_off = int(shard.get("global_off", -1))
+            nbytes = int(shard.get("nbytes", -1))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("FTW shard geometry is invalid") from exc
+        if not isinstance(name, str) or not name or global_off != expected_offset:
+            raise ValueError("FTW shards are not contiguous")
+        if nbytes <= 0 or nbytes % align:
+            raise ValueError("FTW shard length is not aligned")
+        shard_path = os.path.join(root, name)
+        try:
+            physical = os.path.getsize(shard_path)
+        except OSError as exc:
+            raise ValueError(f"FTW shard is missing: {shard_path}") from exc
+        physical_sizes.append(physical)
+        expected_offset += nbytes
+    if expected_offset != total:
+        raise ValueError("FTW shard geometry does not reconcile with total_bytes")
+
+    tensors = index.get("tensors")
+    if not isinstance(tensors, list):
+        raise ValueError("FTW index tensors must be a list")
+    names: set[str] = set()
+    for tensor in tensors:
+        if not isinstance(tensor, dict):
+            raise ValueError("FTW tensor entry must be an object")
+        name = tensor.get("name")
+        try:
+            global_off = int(tensor.get("global_off", -1))
+            nbytes = int(tensor.get("nbytes", -1))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("FTW tensor geometry is invalid") from exc
+        if not isinstance(name, str) or not name or name in names:
+            raise ValueError("FTW tensor names must be unique")
+        names.add(name)
+        if global_off < 0 or global_off % align or nbytes < 0 or global_off + nbytes > total:
+            raise ValueError("FTW tensor geometry is invalid")
+    return ordered, physical_sizes, total
+
+
+def _assert_zero_tail(path: str, pad_bytes: int) -> None:
+    with open(path, "rb") as handle:
+        handle.seek(-pad_bytes, os.SEEK_END)
+        tail = handle.read(pad_bytes)
+    if len(tail) != pad_bytes or any(tail):
+        raise ValueError("FTW terminal padding is not an all-zero page")
+
+
+def ensure_ftw_terminal_padding(
+    path: str,
+    *,
+    expected_unpadded_bytes: int,
+    target_bytes: int,
+    pad_bytes: int = ALIGN,
+) -> dict:
+    """Adopt or append one deterministic terminal FTW-v1 padding page.
+
+    ``expected_unpadded_bytes`` and ``target_bytes`` are explicit so callers cannot
+    silently pad an arbitrary extent.  The only accepted discrepancy is exactly one
+    ``pad_bytes`` page.  Existing tensor entries and all bytes before the terminal
+    page are left untouched.  If a process crashed after appending the page but before
+    publishing the index, the physical all-zero tail is adopted idempotently.
+    """
+    root = os.fspath(path)
+    if pad_bytes <= 0 or pad_bytes % ALIGN:
+        raise ValueError("pad_bytes must be a positive FTW alignment multiple")
+    if expected_unpadded_bytes < 0 or expected_unpadded_bytes % pad_bytes:
+        raise ValueError("expected_unpadded_bytes must be non-negative and aligned")
+    if target_bytes < 0 or target_bytes % pad_bytes:
+        raise ValueError("target_bytes must be non-negative and aligned")
+    if target_bytes != expected_unpadded_bytes + pad_bytes:
+        raise ValueError("terminal padding target must be exactly one page above source")
+    index_path, index = _read_ftw_index(root)
+    shards, physical_sizes, indexed_total = _validate_ftw_geometry(root, index, align=pad_bytes)
+    if indexed_total not in (expected_unpadded_bytes, target_bytes):
+        raise ValueError(
+            f"unexpected FTW extent {indexed_total}; expected {expected_unpadded_bytes} "
+            f"or {target_bytes}"
+        )
+    last = shards[-1]
+    last_name = last["file"]
+    last_path = os.path.join(root, last_name)
+    indexed_last_bytes = int(last["nbytes"])
+    physical_last_bytes = physical_sizes[-1]
+
+    # Every non-terminal shard must agree exactly with its index entry.  Only the
+    # final shard may carry the one-page orphan tail while the old index is still
+    # published.
+    for shard, physical in zip(shards[:-1], physical_sizes[:-1]):
+        if physical != int(shard["nbytes"]):
+            raise ValueError("non-terminal FTW shard length does not match its index")
+
+    if indexed_total == target_bytes:
+        if physical_last_bytes != indexed_last_bytes:
+            raise ValueError("padded FTW index does not match physical shard length")
+        _assert_zero_tail(last_path, pad_bytes)
+        _remove_redundant_padding_indexes(index_path, index)
+        return {
+            "state": "ALREADY_PADDED",
+            "index": index_path,
+            "target_bytes": target_bytes,
+            "pad_bytes": pad_bytes,
+        }
+
+    # The old index may describe the original shard or a shard whose terminal page
+    # was durably appended immediately before a crash.  Any other size is ambiguous
+    # and must fail closed instead of truncating or retransferring data.
+    adopted_orphan = physical_last_bytes == indexed_last_bytes + pad_bytes
+    if physical_last_bytes == indexed_last_bytes:
+        with open(last_path, "ab") as handle:
+            remaining = pad_bytes
+            zero_page = bytes(min(1 << 20, pad_bytes))
+            while remaining:
+                chunk = min(remaining, len(zero_page))
+                handle.write(zero_page[:chunk])
+                remaining -= chunk
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+        physical_last_bytes = os.path.getsize(last_path)
+    elif adopted_orphan:
+        _assert_zero_tail(last_path, pad_bytes)
+    else:
+        raise ValueError("FTW shard has a non-terminal or non-aligned extent discrepancy")
+
+    if physical_last_bytes != indexed_last_bytes + pad_bytes:
+        raise ValueError("FTW terminal padding append did not reach the expected extent")
+    _assert_zero_tail(last_path, pad_bytes)
+    updated = dict(index)
+    updated_shards = [dict(shard) for shard in shards]
+    updated_last = dict(updated_shards[-1])
+    updated_last["nbytes"] = indexed_last_bytes + pad_bytes
+    updated_shards[-1] = updated_last
+    updated["shards"] = updated_shards
+    updated["total_bytes"] = target_bytes
+    _atomic_json_document(index_path, updated)
+
+    # Reopen the published index and verify that only the terminal metadata changed.
+    _published_path, published = _read_ftw_index(root)
+    _validate_ftw_geometry(root, published, align=pad_bytes)
+    if int(published.get("total_bytes", -1)) != target_bytes:
+        raise ValueError("FTW terminal padding index publication did not reach target")
+    published_shards = published.get("shards")
+    if published_shards[:-1] != shards[:-1] or published_shards[-1].get("global_off") != last.get("global_off"):
+        raise ValueError("FTW terminal padding changed non-terminal shard metadata")
+    if int(published_shards[-1].get("nbytes", -1)) != indexed_last_bytes + pad_bytes:
+        raise ValueError("FTW terminal padding shard length mismatch")
+    _remove_redundant_padding_indexes(index_path, published)
+    return {
+        "state": "RECOVERED" if adopted_orphan else "PADDED",
+        "index": index_path,
+        "target_bytes": target_bytes,
+        "pad_bytes": pad_bytes,
+    }
 
 
 # ============================== writer ==============================

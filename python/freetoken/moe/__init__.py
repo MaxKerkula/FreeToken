@@ -71,4 +71,19 @@ __all__ = [
     "SUPPORTED_MOE_BACKENDS",
     "OFFLOAD_MOE_BACKENDS",
     "is_offload_moe_backend",
+    "FileExpertSource",
+    "ExpertSourceError",
+    "write_expert_sidecar",
+    "write_expert_sidecar_from_safetensors",
+    "adapt_expert_tensor_record",
 ]
+
+# Kept at module bottom to avoid importing torch/file-I/O helpers while the
+# backend registry is initialized by lightweight callers.
+from .expert_source import (  # noqa: E402
+    ExpertSourceError,
+    FileExpertSource,
+    adapt_expert_tensor_record,
+    write_expert_sidecar,
+    write_expert_sidecar_from_safetensors,
+)

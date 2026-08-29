@@ -232,7 +232,28 @@ def load_weight(
     # fails loudly in load_state_dict (strict missing/unexpected expert keys), so the reader
     # just yields the stored weight tensors regardless of the include_moe_experts flag.
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, iter_ftw_weights
+    from freetoken.checkpoint.qwen4_artifact import load_qwen4_artifact_manifest
     from freetoken.models.config import VISION_KEY_PREFIXES, vision_load_enabled
+
+    # A modular Qwen4 artifact keeps active weights in a nested FTW target while
+    # the root directory owns the manifest, Q3 PLE sidecar, and mixed expert tiers.
+    # Resolve that target before the ordinary FTW/source branches.  The resolver is
+    # deliberately optional so every unmarked checkpoint follows the historical path.
+    artifact = load_qwen4_artifact_manifest(model_path)
+    if artifact is not None:
+        artifact.verify_active()
+        active_path = artifact.active_path
+        if active_path.is_file() and active_path.name == "freetoken_weight.json":
+            active_path = active_path.parent
+        if not is_ftw_checkpoint(str(active_path)):
+            raise ValueError(f"Qwen4 modular active target is not an FTW checkpoint: {active_path}")
+        for name, tensor in iter_ftw_weights(str(active_path)):
+            # Qwen4's loader uses ``visual.*`` after canonical renaming; the generic
+            # prefixes cover model variants that retain ``vision_tower``/``embed_vision``.
+            if name.startswith(("visual.",) + VISION_KEY_PREFIXES):
+                continue
+            yield name, tensor
+        return
 
     if is_ftw_checkpoint(model_path):
         # The FTW dense shard stores whatever existed at conversion, including the vision

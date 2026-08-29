@@ -25,13 +25,14 @@ from freetoken.layers import (
     get_rope,
 )
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.config import ModelConfig
 from freetoken.models.qwen3_5_moe.attention import Qwen3_5Attention
+from freetoken.checkpoint.q3_ple import Q3PLEReader
 from freetoken.models.qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet
+from freetoken.models.quant_linear import make_col_merged_quant, make_replicated_quant
 from freetoken.utils import download_hf_weight, nvtx_annotate
 
 if TYPE_CHECKING:
-    from freetoken.models.config import ModelConfig
-
     from .args import Qwen4ExpArgs
 
 
@@ -187,8 +188,16 @@ class _GatedResidual(BaseOP):
         self.hidden_size = config.hidden_size
         hc_size = self.hc_count * self.hidden_size
         self.hc_norm = _GroupedRMSNorm(hc_size, self.hidden_size, config.rms_norm_eps)
-        self.input_mix_weight_down = LinearReplicated(hc_size, args.hc_lowrank, has_bias=False)
-        self.input_mix_weight_up = LinearReplicated(args.hc_lowrank, hc_size, has_bias=False)
+        # The frozen Qwen4 active map keeps mHC input-mix down/up native NVFP4 when
+        # ``dense_quant=nvfp4`` is explicitly selected.  Block injection remains BF16.
+        self.input_mix_weight_down = make_replicated_quant(
+            "none", getattr(config, "dense_quant", "none"), hc_size, args.hc_lowrank,
+            has_bias=False,
+        )
+        self.input_mix_weight_up = make_replicated_quant(
+            "none", getattr(config, "dense_quant", "none"), args.hc_lowrank, hc_size,
+            has_bias=False,
+        )
         self.block_inject_weight = (
             LinearReplicated(hc_size, self.hc_count, has_bias=False) if combine else None
         )
@@ -208,10 +217,14 @@ class _GatedResidual(BaseOP):
 class _SharedExpert(BaseOP):
     def __init__(self, config: ModelConfig):
         width = config.shared_expert_intermediate_size
-        self.gate_up_proj = LinearColParallelMerged(
-            config.hidden_size, [width, width], has_bias=False
+        self.gate_up_proj = make_col_merged_quant(
+            "none", getattr(config, "dense_quant", "none"), config.hidden_size,
+            [width, width], has_bias=False,
         )
-        self.down_proj = LinearRowParallel(width, config.hidden_size, has_bias=False)
+        self.down_proj = make_replicated_quant(
+            "none", getattr(config, "dense_quant", "none"), width, config.hidden_size,
+            has_bias=False,
+        )
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(hidden)))
@@ -278,17 +291,28 @@ def build_ngram_ids(
     return torch.cat(blocks, dim=-1)
 
 
-def _ple_request_tokens(req, forwarded_ids: torch.Tensor | None = None) -> torch.Tensor:
-    """Return the complete host token history visible to this forward.
+def _ple_request_tokens(
+    req,
+    forwarded_ids: torch.Tensor | None = None,
+    *,
+    start: int = 0,
+) -> torch.Tensor:
+    """Return host-visible request tokens from ``start`` through ``device_len``.
 
     The overlap scheduler advances ``device_len`` before it drains the prior
     sampled token to ``req.input_ids``. During decode, that one current token is
     already present in ``batch.input_ids``. Join it to the committed host prefix
-    so PLE hashes the same history as a non-overlapped forward.
+    so PLE hashes the same history as a non-overlapped forward. The default
+    preserves the complete-history contract; callers may select a validated
+    suffix when only the N-gram dependency prefix is needed.
     """
+    if not 0 <= start <= req.device_len:
+        raise ValueError(
+            f"Qwen4-Exp PLE history start {start} is outside [0, {req.device_len}]"
+        )
     host_len = req.input_ids.numel()
     if host_len >= req.device_len:
-        return req.input_ids[: req.device_len]
+        return req.input_ids[start : req.device_len]
     if host_len != req.cached_len:
         raise RuntimeError(
             "Qwen4-Exp PLE host history has an unexpected gap: "
@@ -300,7 +324,14 @@ def _ple_request_tokens(req, forwarded_ids: torch.Tensor | None = None) -> torch
             "Qwen4-Exp PLE needs the current forwarded tokens: "
             f"got {actual}, expected {req.extend_len}"
         )
-    return torch.cat((req.input_ids[: req.cached_len], forwarded_ids.to(device="cpu")))
+    host_start = min(start, req.cached_len)
+    forwarded_start = max(0, start - req.cached_len)
+    return torch.cat(
+        (
+            req.input_ids[host_start : req.cached_len],
+            forwarded_ids[forwarded_start:].to(device="cpu"),
+        )
+    )
 
 
 class _HostNGramEmbedding(BaseOP):
@@ -323,8 +354,20 @@ class _HostNGramEmbedding(BaseOP):
         self._scale = torch.tensor(1.0, dtype=torch.bfloat16)
         self._host_constants: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         self._dummy = False
+        self._q3_reader: Q3PLEReader | None = None
 
-    def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
+    def load_host_weights(
+        self,
+        model_path: str,
+        *,
+        dummy: bool = False,
+        ple_format: str = "fp8_safetensors",
+    ) -> None:
+        if ple_format == "q3_ple_32":
+            self.load_q3_ple_weights(model_path)
+            return
+        if ple_format != "fp8_safetensors":
+            raise ValueError(f"unsupported Qwen4 PLE format: {ple_format}")
         if dummy:
             self._dummy = True
             return
@@ -382,6 +425,28 @@ class _HostNGramEmbedding(BaseOP):
                 f"PLE table has {int(self._shard_ends[-1])} rows, needs {expected_rows}"
             )
 
+    def load_q3_ple_weights(self, manifest_path: str) -> None:
+        """Opt into the native Q3_PLE_32 sidecar; FP8 Safetensors stays default."""
+
+        reader = Q3PLEReader(manifest_path)
+        if self._host_constants is None:
+            self._host_constants = (
+                self.layer_multipliers.cpu(),
+                self.ngram_heads_vocab_sizes.cpu(),
+                self.ngram_heads_offsets.cpu(),
+            )
+        expected_rows = int(self._host_constants[1][-1] + self._host_constants[2][-1])
+        if reader.row_count < expected_rows:
+            reader.close()
+            raise RuntimeError(
+                f"Q3_PLE_32 table has {reader.row_count} rows, needs {expected_rows}"
+            )
+        self._q3_reader = reader
+        self._shards = []
+        self._handles = []
+        self._shard_ends = torch.empty(0, dtype=torch.long)
+        self._scale = torch.tensor(reader.weight_scale, dtype=torch.bfloat16)
+
     def _current_ngram_ids(self) -> torch.Tensor:
         if self._host_constants is None:
             raise RuntimeError("Qwen4-Exp PLE host weights are not loaded")
@@ -400,7 +465,8 @@ class _HostNGramEmbedding(BaseOP):
                 forwarded = forwarded_host[
                     forwarded_offset : forwarded_offset + extend_len
                 ]
-            tokens = _ple_request_tokens(req, forwarded)
+            history_start = max(0, req.cached_len - (self.ngram_size - 1))
+            tokens = _ple_request_tokens(req, forwarded, start=history_start)
             all_ids = build_ngram_ids(
                 tokens,
                 ngram_size=self.ngram_size,
@@ -410,8 +476,17 @@ class _HostNGramEmbedding(BaseOP):
                 vocab_sizes=vocab_sizes,
                 offsets=offsets,
             )
-            pieces.append(all_ids[req.cached_len : req.device_len])
+            pieces.append(
+                all_ids[
+                    req.cached_len - history_start : req.device_len - history_start
+                ]
+            )
             forwarded_offset += extend_len
+        if forwarded_offset != batch.input_ids.numel():
+            raise RuntimeError(
+                f"Qwen4-Exp PLE consumed {forwarded_offset} forwarded tokens, "
+                f"but the batch carries {batch.input_ids.numel()}"
+            )
         result = torch.cat(pieces, dim=0)
         if result.shape[0] != batch.input_ids.numel():
             raise RuntimeError(
@@ -424,6 +499,10 @@ class _HostNGramEmbedding(BaseOP):
             token_count = get_global_ctx().batch.input_ids.numel()
             return torch.zeros(token_count, self.embedding_dim, device=device, dtype=dtype)
         ngram_ids = self._current_ngram_ids().reshape(-1)
+        if self._q3_reader is not None:
+            rows = self._q3_reader.gather(ngram_ids.tolist())
+            embedded = rows.to(device=device, dtype=dtype) * self._scale.to(device=device, dtype=dtype)
+            return embedded.view(-1, self.embedding_dim)
         shard_ids = torch.bucketize(ngram_ids, self._shard_ends, right=True)
         output = torch.empty(
             ngram_ids.numel(),
@@ -467,6 +546,10 @@ class _PLELayer(BaseOP):
 
     def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
         self.ple_embedding.load_host_weights(model_path, dummy=dummy)
+
+    def load_q3_ple_weights(self, manifest_path: str) -> None:
+        """Load an explicit Q3_PLE_32 sidecar for this layer."""
+        self.ple_embedding.load_q3_ple_weights(manifest_path)
 
     def _short_conv(self, hidden: torch.Tensor) -> torch.Tensor:
         batch = get_global_ctx().batch
@@ -600,7 +683,9 @@ class Qwen4ExpDecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
         self._layer_id = layer_id
         self._is_linear = config.is_linear_layer(layer_id)
-        dense_config = replace(config, expert_quant="none", attn_quant="none")
+        # Strip routed-expert quantization from the dense attention constructor, but
+        # preserve the explicit Qwen4 active ``attn_quant`` selection.
+        dense_config = replace(config, expert_quant="none")
         if self._is_linear:
             group = config.linear_attention_group()
             assert group is not None
@@ -614,7 +699,8 @@ class Qwen4ExpDecoderLayer(BaseOP):
                 rms_norm_eps=config.rms_norm_eps,
                 layer_id=layer_id,
                 expert_quant="none",
-                attn_quant="none",
+                attn_quant=config.attn_quant,
+                nvfp4_qkvz=(config.attn_quant == "nvfp4"),
             )
             self.linear_attn.norm = _GatedRMSNorm(
                 group.value_head_dim,
@@ -659,14 +745,56 @@ class Qwen4ExpModel(BaseOP):
         self._image_token_id = config.image_token_id
 
     def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
+        # Modular Qwen4 artifacts carry an explicit Q3_PLE sidecar.  Once the
+        # target marker is present, selecting that sidecar is mandatory: silently
+        # falling back to the 51-GiB FP8 safetensors table would defeat the artifact's
+        # bounded host-memory contract.  Unmarked source checkpoints keep the original
+        # FP8 path unchanged.
+        if not dummy:
+            from freetoken.checkpoint.qwen4_artifact import (
+                load_qwen4_artifact_manifest,
+                qwen4_text_only_marker,
+            )
+
+            artifact = load_qwen4_artifact_manifest(model_path)
+            if artifact is not None:
+                self.load_q3_ple_weights(str(artifact.ple_manifest_path))
+                return
+            # A known text-only target marker without its modular manifest is
+            # incomplete.  Do not silently reopen the source FP8 PLE table.
+            try:
+                from freetoken.utils import cached_load_hf_config
+
+                if qwen4_text_only_marker(cached_load_hf_config(model_path)):
+                    raise ValueError(
+                        "Qwen4 text-only target is marked but manifest.json is missing"
+                    )
+            except ValueError:
+                raise
+            except Exception:
+                # Unmarked hub/source paths retain the historical loader behavior;
+                # parse_config remains the authoritative marker validator.
+                pass
         for layer in self.layers.op_list:
             if layer.ple is not None:
                 layer.ple.load_host_weights(model_path, dummy=dummy)
 
+    def load_q3_ple_weights(self, manifest_paths: str | dict[int, str]) -> None:
+        """Opt into Q3_PLE_32 using one manifest or a layer-id manifest map."""
+        for layer_id, layer in enumerate(self.layers.op_list):
+            if layer.ple is None:
+                continue
+            manifest = manifest_paths[layer_id] if isinstance(manifest_paths, dict) else manifest_paths
+            layer.ple.load_q3_ple_weights(manifest)
+
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         hidden = self.embed_tokens.forward(input_ids)
         mm_embeds = getattr(get_global_ctx().batch, "mm_embeds", None)
-        if mm_embeds is not None and self._image_token_id is not None:
+        if mm_embeds is not None and self._image_token_id is None:
+            raise RuntimeError(
+                "image inputs are not supported by this text-only Qwen4 modular artifact"
+            )
+        if mm_embeds is not None:
             mask = input_ids == self._image_token_id
             slots = int(mask.sum().item())
             if slots != mm_embeds.shape[0]:
@@ -706,6 +834,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
         self.model.load_host_weights(model_path, dummy=dummy)
+
+    def load_q3_ple_weights(self, manifest_paths: str | dict[int, str]) -> None:
+        self.model.load_q3_ple_weights(manifest_paths)
 
     def forward(self) -> torch.Tensor:
         hidden = self.model.forward(get_global_ctx().batch.input_ids)
